@@ -915,6 +915,10 @@ if(STRATA_NATIVE_EXPERTS)
       add_test(NAME native_expert_parity_refuses_q6_K COMMAND native_expert_parity --synthetic q6_K/q8_0)
       set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
     endif()
+    if(STRATA_ENABLE_CUDA)   # the FP8 PLE table (tools/ple_fp8_pack.py) through PleTable vs the checkpoint's own values
+      add_executable(ple_fp8_parity src/kernels/ple_fp8_parity.cpp)
+      target_link_libraries(ple_fp8_parity PRIVATE strata_kernels CUDA::cudart)
+    endif()
   endif()
 endif()
 
