@@ -43,7 +43,7 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
                         int pos_base, const float* __restrict__ gamma, float epsilon,
                         float* __restrict__ tail, float* __restrict__ dead,
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,
-                        int max_cells, float theta_scale, float freq_scale, float corr_low,
+                        int max_cells, RopeTab rt, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
                         const int32_t* __restrict__ mtab) {
     const int pos = *pos_dev, d = threadIdx.x;
@@ -87,9 +87,8 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
         const int pair = d % (ROT / 2);
         // The spare (pos == 0) keeps its zero angle; under YaRN the mscale magnitude still rides in
         // through cos(0) - which is exactly what the queries are scaled by, so the top-k is unmoved.
-        const float theta_extrap = (pos == 0 ? 0 : mrope_pos(mtab, rope_pos, pair)) * powf(theta_scale, float(pair));
         float c, s;
-        rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
+        rope_angle(rt, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, pos == 0 ? 0 : mrope_pos(mtab, rope_pos, pair), pair, c, s);
         const float a = values[pair], z = values[pair + ROT / 2];
         y = d < ROT / 2 ? a * c - z * s : a * s + z * c;
     }
@@ -103,18 +102,17 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
 // the RMS norm, gamma, the rotation at pos_base + 4b.  `k(j)` is the key of the block's cell j: a row of this batch
 // (cell >= p0) or the tail the previous batch left (cell < p0).  Only the batch's last completed block writes the
 // spare after it (every earlier one's is overwritten by the next block in order).
-__device__ __forceinline__ float pooled_value(const float* values, int d, int rope_pos, float theta_scale,
-                                              float freq_scale, float corr_low, float corr_high,
+__device__ __forceinline__ float pooled_value(const float* values, int d, int rope_pos, const RopeTab& rt,
+                                              float theta_scale, float freq_scale, float corr_low, float corr_high,
                                               float ext_factor, float mscale, const int32_t* mtab, bool zero_pos) {
     float y = values[d];
     if (d < ROT) {
         const int pair = d % (ROT / 2);
-        // The same rotation the single append applies, rope_scaling.hpp's helper shared: under none this is
-        // today's cosf/sinf; under linear/YaRN the pooled keys move with the cache's K, and the spare's zero
-        // angle carries the mscale magnitude through cos(0) exactly as the single append's does.
-        const float theta_extrap = (zero_pos ? 0 : mrope_pos(mtab, rope_pos, pair)) * powf(theta_scale, float(pair));
+        // The same rotation the single append applies: the session's table, or under linear/YaRN rope_scaling.hpp's
+        // helper - the pooled keys move with the cache's K, and the spare's zero angle carries the mscale magnitude
+        // through cos(0) exactly as the single append's does.
         float c, s;
-        rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
+        rope_angle(rt, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, zero_pos ? 0 : mrope_pos(mtab, rope_pos, pair), pair, c, s);
         const float a = values[pair], z = values[pair + ROT / 2];
         y = d < ROT / 2 ? a * c - z * s : a * s + z * c;
     }
@@ -132,7 +130,7 @@ __device__ __forceinline__ float norm_scale(float mean, float* partials, int d) 
 }
 // cell 0 of a sequence: the spare (every gather index names cell 0), written to pooled[0] and dead
 __global__ void append_first(const float* __restrict__ raw, const float* __restrict__ gamma, float epsilon,
-                             float* __restrict__ dead, float* __restrict__ pooled, float theta_scale,
+                             float* __restrict__ dead, float* __restrict__ pooled, RopeTab rt, float theta_scale,
                              float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
                              const int32_t* __restrict__ mtab) {
     const int d = threadIdx.x;
@@ -151,16 +149,15 @@ __global__ void append_first(const float* __restrict__ raw, const float* __restr
     if (d < D) values[d] = scale * mean * gamma[d];
     __syncthreads();
     if (d >= D) return;
-    const float y = pooled_value(values, d, 0, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale,
-                                 mtab, true);
+    const float y = pooled_value(values, d, 0, rt, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, true);
     pooled[d] = y;
     dead[d] = y;
 }
 __global__ void append_blocks(const float* __restrict__ raw, int64_t n, int64_t p0, int pos_base,
                               const float* __restrict__ gamma, float epsilon, const float* __restrict__ tail,
                               const float* __restrict__ dead, float* __restrict__ pooled, int32_t* __restrict__ block_pos,
-                              int64_t first_block, int64_t last_block, float theta_scale, float freq_scale,
-                              float corr_low, float corr_high, float ext_factor, float mscale,
+                              int64_t first_block, int64_t last_block, RopeTab rt, float theta_scale,
+                              float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
                               const int32_t* __restrict__ mtab) {
     const int64_t b = first_block + blockIdx.x;
     const int d = threadIdx.x;
@@ -183,8 +180,7 @@ __global__ void append_blocks(const float* __restrict__ raw, int64_t n, int64_t 
     __syncthreads();
     if (d >= D) return;
     const int rope_pos = pos_base + R * (int) b;
-    pooled[std::size_t(b) * D + d] = pooled_value(values, d, rope_pos, theta_scale, freq_scale, corr_low, corr_high,
-                                                  ext_factor, mscale, mtab, false);
+    pooled[std::size_t(b) * D + d] = pooled_value(values, d, rope_pos, rt, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, false);
     if (b == last_block) {
         pooled[std::size_t(b + 1) * D + d] = dead[d];
         if (d == 0) *block_pos = rope_pos;
@@ -229,7 +225,7 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
     append<<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_base,gamma,epsilon,
-        b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+        b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),rope_table_scaled(scaling),theta_scale,k.freq_scale,
         k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table());
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
@@ -245,9 +241,10 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
     const float fsf = k.freq_scale, cl = k.corr_low, ch = k.corr_high, ef = k.ext_factor, ms = k.attn_factor;
+    const RopeTab rt = rope_table_scaled(scaling);
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
     const int32_t* mtab = mrope_table();
-    if (p0 == 0) append_first<<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
+    if (p0 == 0) append_first<<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, rt, theta_scale,
                                                      fsf, cl, ch, ef, ms, mtab);
     // completed blocks: those whose last cell (4b+3) lies in [p0, p0 + n)
     const int64_t first = p0 <= R - 1 ? 0 : (p0 - (R - 1) + R - 1) / R;       // the smallest b with 4b+3 >= p0
@@ -255,7 +252,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     if (hi >= first)
         append_blocks<<<(unsigned) (hi - first + 1), THREADS, 0, st>>>(raw, n, p0, pos_base, gamma, epsilon, b.tail,
                                                                        b.dead, b.pooled, b.block_pos, first, hi,
-                                                                       theta_scale, fsf, cl, ch, ef, ms, mtab);
+                                                                       rt, theta_scale, fsf, cl, ch, ef, ms, mtab);
     append_tail<<<R - 1, D, 0, st>>>(raw, n, p0, b.tail);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

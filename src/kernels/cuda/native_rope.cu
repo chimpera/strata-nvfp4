@@ -28,6 +28,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -39,8 +40,8 @@ bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
     return x <= y ? y - x < an : x - y < bn;
 }
 __global__ void apply(const float* x, float* out, int rows, int width,
-                      int n_rot, float theta_scale, float freq_scale, float corr_low, float corr_high,
-                      float ext_factor, float mscale, const int* positions, const int32_t* mtab) {
+                      int n_rot, RopeTab rt, float theta_scale, float freq_scale, float corr_low,
+                      float corr_high, float ext_factor, float mscale, const int* positions, const int32_t* mtab) {
     const int row = blockIdx.y;
     const int pair = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows || pair >= width / 2) return;
@@ -52,9 +53,8 @@ __global__ void apply(const float* x, float* out, int rows, int width,
         }
         return;
     }
-    const float theta_extrap = mrope_pos(mtab, positions[row], pair) * powf(theta_scale, float(pair));
     float c, s;
-    rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
+    rope_angle(rt, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mrope_pos(mtab, positions[row], pair), pair, c, s);
     const float a = x[start + pair], b = x[start + pair + n_rot / 2];
     out[start + pair] = a * c - b * s;
     out[start + pair + n_rot / 2] = a * s + b * c;
@@ -72,6 +72,20 @@ int mrope_dev() {
 }  // namespace
 void mrope_table_set(const int32_t* device_table) { mrope_tab[mrope_dev()].store(device_table, std::memory_order_relaxed); }
 const int32_t* mrope_table() { return mrope_tab[mrope_dev()].load(std::memory_order_relaxed); }
+namespace {
+RopeTab rope_tab[kMropeDevices] = {};   // set once per device at session init, before any graph is captured
+}
+void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, double base) {
+    RopeTab& t = rope_tab[mrope_dev()];
+    if (max_pos > t.max_pos) t = RopeTab{cos_tab, sin_tab, max_pos, base};   // the longest table of the device
+}
+RopeTab rope_table_for(double freq_base) {
+    static const bool legacy = std::getenv("STRATA_ROPE_LEGACY") != nullptr;
+    if (legacy) return RopeTab{nullptr, nullptr, 0, freq_base, std::pow((float) freq_base, -2.0f / 64.0f)};
+    const RopeTab& t = rope_tab[mrope_dev()];
+    if (t.cos != nullptr && (float) t.base == (float) freq_base) return t;
+    return RopeTab{nullptr, nullptr, 0, freq_base};
+}
 void native_rope_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_rope_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
@@ -93,8 +107,8 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
     const RopeKernelArgs k = scaling.kernel_args(n_rot);   // none: the identity constants
     apply<<<dim3((head_dim / 2 + 127) / 128, rows), 128, 0,
-              static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale,
-                                                   k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+              static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, rope_table_scaled(scaling),
+                                                   theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
                                                    k.attn_factor, positions, mrope_table());
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
