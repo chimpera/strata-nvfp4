@@ -219,6 +219,12 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
+    elif thinking is None and not req.get("reasoning_budget_tokens"):
+        # Anthropic's thinking is opt-in. Claude Code's helper calls (a session title, a topic check) ask for none
+        # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
+        # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs; a
+        # request's own thinking budget (#123's reasoning_budget_tokens) asks for thinking as "thinking" does.
+        kwargs["enable_thinking"] = False
     return _late_system_to_user(messages), tools, kwargs
 
 

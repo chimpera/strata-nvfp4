@@ -30,6 +30,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -102,6 +103,31 @@ class EngineDied(RuntimeError):
 class GpuBusy(RuntimeError):
     """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
     model server) is using it, so the engine is not started into the little that is left."""
+ENGINE_REQUEST = re.compile(
+    r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+ read in (?P<read>[\d.]+) ms \((?P<pp>[\d.]+) tok/s\), "
+    r"(?P<gen>\d+) generated in (?P<gen_ms>[\d.]+) ms \((?P<tg>[\d.]+) tok/s\)")
+
+
+def echo_requests(log_path: str, offset: int) -> None:
+    """STRATA_REQUEST_LINES=1: one stdout line per finished request, from the engine's own summary in its log.
+
+    The engine's stderr goes to the log file (the start narrator reads it), so a supervisor that only sees this
+    process's output - a tray, llama-swap - has no per-request numbers. This re-states the engine's line with the
+    total the two times make: `request prompt P cached C output O ttft T ms total S ms prefill X tok/s decode Y tok/s`.
+    """
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        f.seek(offset)
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(0.2)
+                continue
+            m = ENGINE_REQUEST.search(line)
+            if m:
+                read_ms, gen_ms = float(m["read"]), float(m["gen_ms"])
+                print("[strata] request prompt %s cached %s output %s ttft %.0f ms total %.0f ms prefill %s tok/s "
+                      "decode %s tok/s" % (m["prompt"], m["reused"], m["gen"], read_ms, read_ms + gen_ms, m["pp"], m["tg"]),
+                      flush=True)
 
 
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
@@ -175,6 +201,10 @@ class StrataEngine:
         if log:
             threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
                              daemon=True).start()
+            # once per server: restart() runs __init__ again, and the one tail keeps reading the same log
+            if os.environ.get("STRATA_REQUEST_LINES") and not getattr(self, "echoing", False):
+                self.echoing = True
+                threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
@@ -1633,6 +1663,8 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
+                elif path == "/v1/messages/count_tokens":
+                    self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -1740,6 +1772,14 @@ def make_handler(svc: Service):
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+
+        def _count_tokens(self, req):
+            """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
+            read for the same request, rendered and tokenized - the model does not run."""
+            req = svc.with_shared(req, "anthropic")
+            messages, tools, kw = anthropic_to_messages(req)
+            prompt = svc.template.render(messages, tools=tools, **kw)
+            self._json(200, {"input_tokens": len(svc.tok.encode(prompt, parse_special=True))})
 
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
@@ -2005,7 +2045,10 @@ def main() -> int:
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
-        engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+        # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
+        # it is told about (WinError 2), so it is made absolute here
+        exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
+        engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
