@@ -323,7 +323,7 @@ struct Options {
 #endif
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
-    /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
+    /// `--prefill auto`: the largest chunk (up to 32768) whose buffers the expert cache can lend.  Every expert a chunk
     /// routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per token (the "ubatch" effect).
     bool prefill_auto = false;
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
@@ -505,7 +505,7 @@ void usage() {
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
-                 "                       the largest chunk up to 8192 whose buffers the expert cache can lend\n"
+                 "                       the largest chunk up to 32768 whose buffers the expert cache can lend\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
@@ -3585,10 +3585,13 @@ int main(int argc, char** argv) {
                  : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
     }();
     auto plan_lend = [&](int64_t& chunk) -> int64_t {
-        static constexpr int64_t kAutoChunks[] = {8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+        // 32768 and 16384: a 32K prompt with IQ2_XS (RTX 5090, 64K context) read at 5,624 tok/s in 8192-token chunks
+        // and 6,465 in one 32768 chunk (40K -> 18K experts streamed; an NVFP4 pack at 262K: 3,535 -> 5,201)
+        static constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
         auto slots_for = lend_slots;
         if (o.prefill_auto) {
             for (const int64_t c : kAutoChunks) {
+                if (c > o.max_context && c > 256) continue;       // no prompt is longer than the context
                 const int64_t k = slots_for(c);
                 if (k + 128 <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots()) { chunk = c; return k; }
             }
@@ -3707,11 +3710,11 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
-            static constexpr int64_t kAutoChunks[] = {8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+            static constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
             int64_t chunk = 0;
             if (o.prefill_auto) {
                 for (const int64_t c : kAutoChunks)
-                    if (fits(c, true)) { chunk = c; break; }
+                    if ((c <= o.max_context || c <= 256) && fits(c, true)) { chunk = c; break; }   // as plan_lend
             } else {
                 for (int64_t c = o.prefill_chunk; c >= 256; c /= 2)
                     if (fits(c, false)) { chunk = c; break; }
