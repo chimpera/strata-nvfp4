@@ -207,11 +207,12 @@ constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + do
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
 // second GEMM (Y = W.hi + W.lo, ~16 mantissa bits): a router that picks its top 10 from the same x decode would.
 // 2 = all but the hyper-connection's; 1 = the hyper-connection's too (its activations are 10240 wide and its up
-// projection writes as much: slower); 0 (the default: opt-in, it changes the prompt path's numbers) = off.
+// projection writes as much: slower); 0 = off (upstream's default). This fork defaults to 2: its NVFP4 router
+// picks closer to decode's (first-token KL halved on short prompts).
 inline int bf16x2_mode() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_PREFILL_BF16X2");
-        return e != nullptr ? std::atoi(e) : 0;
+        return e != nullptr ? std::atoi(e) : 2;
     }();
     return v;
 }
