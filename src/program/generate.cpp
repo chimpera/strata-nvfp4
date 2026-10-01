@@ -79,6 +79,8 @@
 #include <iostream>
 #include <future>
 #include <thread>
+
+#include "strata/prefill/gemm.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -1857,6 +1859,71 @@ int main(int argc, char** argv) {
                          "served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), skip.size());
 
+    {   // the card, and whether this build has code for it (RTX 20/30/40/50: CMAKE_CUDA_ARCHITECTURES 75;86;89;120),
+        // before the expert arena starts loading - a build for other GPUs fails at its first kernel otherwise
+        int dev = 0;
+        cudaDeviceProp p{};
+        const bool known = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess;
+        if (known) {
+            std::fprintf(stderr, "strata generate: GPU %d: %s, compute capability %d.%d%s\n", dev, p.name,
+                         strata::cc_major_of(p.major), strata::cc_minor_of(p.minor),
+                         strata::emulated_cc() ? " (STRATA_EMULATE_CC: a test mode, the card is emulated)" : "");
+        } else {   // the query failed: a placeholder, not an empty name and "sm_00"
+            (void) cudaGetLastError();
+            std::snprintf(p.name, sizeof p.name, "CUDA device %d", dev);
+        }
+        const std::string e = strata::core::device_code_error();
+        if (!e.empty()) {
+            char arch[32] = "an unknown architecture";
+            if (known) std::snprintf(arch, sizeof arch, "sm_%d%d", p.major, p.minor);
+            std::fprintf(stderr, "strata generate: this engine has no code for %s (%s): %s - it is built for "
+                                 "RTX 20/30/40/50 (sm_75, 86, 89, 120); a newer card needs a newer release\n",
+                         p.name, arch, e.c_str());
+            return 1;
+        }
+    }
+    // #285: the expert arena (bound by the drive and its registration) loads on its own thread from here, beside the
+    // dense weights, the PLE table, the session and the drafter; it is joined where it was opened before, ahead of
+    // anything that reads it. Not while --split-skip-if-fits has yet to decide the pin cap (the multi-GPU one);
+    // STRATA_ARENA_SYNC=1 keeps the old order (A/B). The first cuBLAS handle is made on a thread meanwhile too.
+    strata::core::ArenaExpertSource arena_src;
+    // Under WDDM (Windows, WSL2), a multi-GPU run (a layer split, or remote experts) starts with at most 8 GiB of
+    // mapped host pages: pinning all of it into two contexts leaves WDDM refusing every later allocation -
+    // measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail.  Unregistered layers remain
+    // in the resident arena; their streamed experts go through the pinned staging ring.  A Linux driver has no
+    // such limit, so there the whole arena is pinned (#253).  STRATA_ARENA_PIN_GIB overrides both ways.
+    auto arena_pin_limit = [&]() -> uint64_t {
+        const int pin_env = strata::core::arena_pin_cap_gib();   // -1 unset, -2 "auto" (#243, Windows sliced pin)
+        const bool pin_wddm_cap = pin_env < 0 && (o.expert_cache_remote[0] > 0 || multi_gpu) && under_wddm();
+        if (pin_env >= 0)
+            std::fprintf(stderr, "strata generate: STRATA_ARENA_PIN_GIB=%d: %s\n", pin_env,
+                         pin_env == 0 ? "the whole expert arena is pinned" : "the expert arena's pinning is capped");
+        else if (pin_wddm_cap)
+            std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
+                                 "(STRATA_ARENA_PIN_GIB changes it)\n");
+        return pin_env >= 0 ? (uint64_t) pin_env << 30 : pin_wddm_cap ? (8ull << 30) : 0;
+    };
+    const bool arena_async = !o.mmap_experts && !(multi_gpu && split_auto && o.split_skip_if_fits) &&
+                             std::getenv("STRATA_ARENA_SYNC") == nullptr;
+    std::thread arena_thread;
+    bool arena_ok = true;
+    std::string arena_err;
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() { if (t.joinable()) t.join(); }   // an early return must not leave it running
+    } arena_joiner{arena_thread};
+    if (!o.mmap_experts) arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
+    if (arena_async) {
+        const uint64_t pin_limit = arena_pin_limit();
+        int arena_dev = 0;
+        cudaGetDevice(&arena_dev);
+        strata::prefill::gemm_prewarm();
+        arena_thread = std::thread([&, pin_limit, arena_dev] {
+            cudaSetDevice(arena_dev);
+            arena_ok = arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, arena_err, pin_limit,
+                                      o.shared_expert_arena);
+        });
+    }
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
@@ -2462,31 +2529,7 @@ int main(int argc, char** argv) {
     // The earlier "the arena does not fit" conclusion was WRONG and is worth recording: the failure was a stale
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
-    {   // the card, and whether this build has code for it (RTX 20/30/40/50: CMAKE_CUDA_ARCHITECTURES 75;86;89;120),
-        // before the expert arena starts loading - a build for other GPUs fails at its first kernel otherwise
-        int dev = 0;
-        cudaDeviceProp p{};
-        const bool known = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess;
-        if (known) {
-            std::fprintf(stderr, "strata generate: GPU %d: %s, compute capability %d.%d%s\n", dev, p.name,
-                         strata::cc_major_of(p.major), strata::cc_minor_of(p.minor),
-                         strata::emulated_cc() ? " (STRATA_EMULATE_CC: a test mode, the card is emulated)" : "");
-        } else {   // the query failed: a placeholder, not an empty name and "sm_00"
-            (void) cudaGetLastError();
-            std::snprintf(p.name, sizeof p.name, "CUDA device %d", dev);
-        }
-        const std::string e = strata::core::device_code_error();
-        if (!e.empty()) {
-            char arch[32] = "an unknown architecture";
-            if (known) std::snprintf(arch, sizeof arch, "sm_%d%d", p.major, p.minor);
-            std::fprintf(stderr, "strata generate: this engine has no code for %s (%s): %s - it is built for "
-                                 "RTX 20/30/40/50 (sm_75, 86, 89, 120); a newer card needs a newer release\n",
-                         p.name, arch, e.c_str());
-            return 1;
-        }
-    }
     strata::core::FileExpertSource src;
-    strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
@@ -2515,23 +2558,14 @@ int main(int argc, char** argv) {
         }
         srcp = &src;
     } else {
-        arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
-        // Under WDDM (Windows, WSL2), a multi-GPU run (a layer split, or remote experts) starts with at most 8 GiB of
-        // mapped host pages: pinning all of it into two contexts leaves WDDM refusing every later allocation -
-        // measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail.  Unregistered layers remain
-        // in the resident arena; their streamed experts go through the pinned staging ring.  A Linux driver has no
-        // such limit, so there the whole arena is pinned (#253).  STRATA_ARENA_PIN_GIB overrides both ways.
-        const int pin_env = strata::core::arena_pin_cap_gib();   // -1 unset, -2 "auto" (#243, Windows sliced pin)
-        const bool pin_wddm_cap = pin_env < 0 && (o.expert_cache_remote[0] > 0 || multi_gpu) && under_wddm();
-        const uint64_t pin_limit = pin_env >= 0 ? (uint64_t) pin_env << 30 : pin_wddm_cap ? (8ull << 30) : 0;
-        if (pin_env >= 0)
-            std::fprintf(stderr, "strata generate: STRATA_ARENA_PIN_GIB=%d: %s\n", pin_env,
-                         pin_env == 0 ? "the whole expert arena is pinned" : "the expert arena's pinning is capped");
-        else if (pin_wddm_cap)
-            std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
-                                 "(STRATA_ARENA_PIN_GIB changes it)\n");
-        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
-                            o.shared_expert_arena)) {
+        if (arena_async) {   // #285: opened on its own thread since the dense weights started loading
+            arena_thread.join();
+            if (!arena_ok) {
+                std::fprintf(stderr, "strata generate: %s\n", arena_err.c_str());
+                return 1;
+            }
+        } else if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, arena_pin_limit(),
+                                   o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
