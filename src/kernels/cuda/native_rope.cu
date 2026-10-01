@@ -79,6 +79,11 @@ void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, dou
     RopeTab& t = rope_tab[mrope_dev()];
     if (max_pos > t.max_pos) t = RopeTab{cos_tab, sin_tab, max_pos, base};   // the longest table of the device
 }
+void rope_table_forget(const float* cos_tab) {
+    if (cos_tab == nullptr) return;
+    for (RopeTab& t : rope_tab)
+        if (t.cos == cos_tab) t = RopeTab{};
+}
 RopeTab rope_table_for(double freq_base) {
     static const bool legacy = std::getenv("STRATA_ROPE_LEGACY") != nullptr;
     if (legacy) return RopeTab{nullptr, nullptr, 0, freq_base, std::pow((float) freq_base, -2.0f / 64.0f)};

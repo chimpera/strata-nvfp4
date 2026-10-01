@@ -2423,18 +2423,26 @@ int main(int argc, char** argv) {
     // The earlier "the arena does not fit" conclusion was WRONG and is worth recording: the failure was a stale
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
-    {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
-        // otherwise, after the whole expert arena has loaded) - before the arena starts loading
+    {   // the card, and whether this build has code for it (RTX 20/30/40/50: CMAKE_CUDA_ARCHITECTURES 75;86;89;120),
+        // before the expert arena starts loading - a build for other GPUs fails at its first kernel otherwise
         int dev = 0;
         cudaDeviceProp p{};
-        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess)
+        const bool known = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess;
+        if (known) {
             std::fprintf(stderr, "strata generate: GPU %d: %s, compute capability %d.%d%s\n", dev, p.name,
                          strata::cc_major_of(p.major), strata::cc_minor_of(p.minor),
                          strata::emulated_cc() ? " (STRATA_EMULATE_CC: a test mode, the card is emulated)" : "");
+        } else {   // the query failed: a placeholder, not an empty name and "sm_00"
+            (void) cudaGetLastError();
+            std::snprintf(p.name, sizeof p.name, "CUDA device %d", dev);
+        }
         const std::string e = strata::core::device_code_error();
         if (!e.empty()) {
-            std::fprintf(stderr, "strata generate: this engine has no code for %s (sm_%d%d): %s - rebuild it for this "
-                                 "card (setup does: START-HERE.bat --setup)\n", p.name, p.major, p.minor, e.c_str());
+            char arch[32] = "an unknown architecture";
+            if (known) std::snprintf(arch, sizeof arch, "sm_%d%d", p.major, p.minor);
+            std::fprintf(stderr, "strata generate: this engine has no code for %s (%s): %s - it is built for "
+                                 "RTX 20/30/40/50 (sm_75, 86, 89, 120); a newer card needs a newer release\n",
+                         p.name, arch, e.c_str());
             return 1;
         }
     }
@@ -4103,6 +4111,7 @@ int main(int argc, char** argv) {
         // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr) -> bool {
             if (o.prompt_cache <= 0 || L < 1) return true;
+            if (!ver.wait_commit()) return false;   // the session is read below (review of #284: explicit, not by luck)
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
             ConvCheckpoint c;
@@ -4977,6 +4986,10 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 const auto tsp = Clock::now();
+                if (!win && !ver.wait_commit()) {   // the batched path writes the session on its own stream
+                    std::printf("ERR waiting for the last commit failed\n");
+                    return 1;
+                }
                 const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
                 if (trace) {
                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
@@ -6204,6 +6217,7 @@ int main(int argc, char** argv) {
     cudaFree(d_logits);
     cudaFree(d_emb);
     cudaFree(d_parts);
+    if (ss.qsa_states != nullptr) strata::kernels::rope_table_forget(ss.qsa_states[0].cos_tab);   // (review of #280)
     cudaFree(sbuf);
     cudaFree(arena);
     return 0;

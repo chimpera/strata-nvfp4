@@ -175,6 +175,7 @@ Verifier::~Verifier() {
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+    if (commit_ev_) cudaEventDestroy(commit_ev_);
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (arena_) cudaFree(arena_);
@@ -342,7 +343,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) {
+    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&commit_ev_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
     }
@@ -1284,24 +1286,43 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
 }
 
 namespace { bool g_commit_async = false; }
+bool Verifier::wait_commit() {
+    if (commit_pending_) {
+        const OnDevice on_device(device_);
+        if (cudaEventSynchronize(commit_ev_) != cudaSuccess) return false;
+        commit_pending_ = false;
+    }
+    return next_ == nullptr || next_->wait_commit();
+}
+
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
 bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
+    // h_commit_ is mapped: the previous commit graph must have read it (the window in between synchronizes the
+    // stream today; this keeps it true without that)
+    if (commit_pending_) {
+        const cudaError_t we = cudaEventSynchronize(commit_ev_);
+        if (we != cudaSuccess) { err = std::string("verify: commit wait: ") + cudaGetErrorString(we); return false; }
+        commit_pending_ = false;
+    }
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+    if (cudaEventRecord(commit_ev_, cs_) != cudaSuccess) { err = "verify: commit event"; return false; }
+    commit_pending_ = true;
     // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
     // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
     // results are read, i.e. after this graph has run.
     if (!g_commit_async) {
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+        commit_pending_ = false;
     }
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
