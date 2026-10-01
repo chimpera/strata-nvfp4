@@ -513,7 +513,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
         for (int t = 0; t < T; ++t) {
             norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
-            if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
+            if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0 always, INT8 unless STRATA_KV_ROT=0
                 fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
                 fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
             }
