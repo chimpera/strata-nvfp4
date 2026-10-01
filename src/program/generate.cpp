@@ -54,6 +54,7 @@
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/emulate.hpp"
@@ -273,6 +274,9 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    /// The fork's low-RAM mode: -1 auto (on below 96 GB installed), 0 --no-low-ram, 1 --low-ram / --ram-budget.  On, it
+    /// is --mmap-experts with --resident-budget-gib (the --ram-budget, else the available RAM less 6 GiB).
+    int low_ram = -1;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -565,7 +569,11 @@ void usage() {
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
                  "  --resident-experts   the low-RAM PC's resident mode (setup): --mmap-experts --resident-cpu-experts\n"
                  "                       with the copy page-locked when possible, 4 GiB headroom, plain mmap if it\n"
-                 "                       does not fit.  Same answers as --mmap-experts for the same placement.\n");
+                 "                       does not fit.  Same answers as --mmap-experts for the same placement.\n"
+                 "  --low-ram            (this fork) --mmap-experts --resident-budget-gib with the available RAM less\n"
+                 "                       6 GiB: the hottest experts the GPU cache does not hold in RAM, the rest read\n"
+                 "                       from the files unbuffered.  On by itself below 96 GB installed; --no-low-ram:\n"
+                 "                       never.  --ram-budget GIB: the same with at most GIB in RAM.\n");
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
@@ -1200,6 +1208,14 @@ int main(int argc, char** argv) {
             if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
                 o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
         }
+        else if (a == "--low-ram") o.low_ram = 1;
+        else if (a == "--no-low-ram") o.low_ram = 0;
+        else if (a == "--ram-budget") {
+            const double gib = std::atof(next("--ram-budget"));
+            if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --ram-budget needs GIB > 0\n"); return 2; }
+            o.resident_budget = (uint64_t) (gib * 1073741824.0);
+            o.low_ram = 1;
+        }
         else if (a == "--resident-budget-gib") {
             const double gib = std::atof(next("--resident-budget-gib"));
             if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0\n"); return 2; }
@@ -1287,6 +1303,28 @@ int main(int argc, char** argv) {
         }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
+    // ---- the fork's low-RAM mode.  The resident arena needs every expert in RAM (63 GiB for the NVFP4 pack); below
+    // 96 GB installed that cannot fit beside Windows, so the experts the GPU cache does not hold go to a RAM budget
+    // (0.1.31's tier: hottest first, page-locked) and the rest are read from the files when needed - unbuffered,
+    // since such a PC's file cache could not keep them either (FileExpertSource::set_unbuffered)
+    if (o.low_ram != 0 && !o.mmap_experts && o.shared_expert_arena.empty() && !o.expert_profile.empty() && !multi_gpu) {
+        const uint64_t installed = strata::platform::total_physical_memory();
+        if (o.low_ram == 1 || (installed > 0 && installed < (96ull << 30))) {
+            o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
+            o.resident_headroom = 6ull << 30;   // left to Windows and the rest of the engine's host memory
+            if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
+                o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+            if (o.resident_budget == 0) o.resident_budget = installed > 0 ? installed : (1ull << 40);   // clamped to
+                                                                       // the available RAM less the headroom
+            std::fprintf(stderr, "strata generate: low RAM (%s; %.1f GiB installed): --mmap-experts with a RAM budget "
+                                 "of %s, the rest of the experts read from the files\n",
+                         o.low_ram == 1 ? "--low-ram" : "below 96 GB installed", (double) installed / 1073741824.0,
+                         o.resident_budget >= installed ? "the available RAM less the headroom" : "--ram-budget");
+        }
+    } else if (o.low_ram == 1 && !o.mmap_experts) {
+        std::fprintf(stderr, "strata generate: --low-ram needs one GPU and an --expert-profile (and no shared arena)\n");
+        return 2;
+    }
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
         return 2;
@@ -2469,7 +2507,7 @@ int main(int argc, char** argv) {
         // #286: with a RAM budget the hottest experts live in it, and the rest are read from the drive unbuffered
         // when the file cache could not keep them beside the budget anyway (a 32 GB PC) - the mapped reads' page
         // faults are small requests on the critical path, and their pages take the RAM the budget was sized for
-        if (src.gguf_mode() && (o.resident_budget > 0 || std::getenv("STRATA_UNBUFFERED_LOAD") != nullptr)) {
+        if (o.resident_budget > 0 || std::getenv("STRATA_UNBUFFERED_LOAD") != nullptr) {
             std::string why;
             const bool ub = src.set_unbuffered(o.resident_budget, why);
             std::fprintf(stderr, "strata generate: the file tier reads %s (%s)\n",
