@@ -36,6 +36,8 @@ struct RopeTab {
 void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, double base);
 /// The registered table when it was built with `freq_base`; otherwise none, and the kernels compute in float64.
 RopeTab rope_table_for(double freq_base);
+/// a session's table is being freed: no device keeps reading it (the next session sets its own)
+void rope_table_forget(const float* cos_tab);
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 /// ggml rope_multi, is_imrope, sections {11, 11, 10, 0}: sector = pair % 32; sector % 3 == 1 -> h (sector < 33),

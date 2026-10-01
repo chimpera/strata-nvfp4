@@ -112,6 +112,9 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// Waits for the last commit graph (this stage's and the next ones'), if one may still run: before anything
+    /// reads or writes the session from another stream or the host (the batched prompt path, a checkpoint).
+    bool wait_commit();
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint) synchronizes the device
@@ -184,6 +187,8 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
+    cudaEvent_t commit_ev_ = nullptr;   ///< recorded after each commit graph
+    bool commit_pending_ = false;       ///< an async commit not waited for yet
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
