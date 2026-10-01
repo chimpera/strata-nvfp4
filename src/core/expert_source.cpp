@@ -2323,7 +2323,7 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
 // `unbuffered` (Windows, experts_unbuffered): each chunk's 4 KiB-aligned window is read with FILE_FLAG_NO_BUFFERING into
 // an aligned buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
-                            int threads, bool unbuffered = false, const std::atomic<int>* ready = nullptr) {
+                            int threads, bool unbuffered, const std::atomic<int>* ready) {
     // `ready`: layer l is written only once *ready > l + 1 (a PinnedArena registering its slices meanwhile; the next
     // slice too, since its registration starts on the page that may hold this layer's tail)
     auto wait_ready = [ready](int64_t l) {
