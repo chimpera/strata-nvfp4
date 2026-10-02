@@ -1397,8 +1397,11 @@ class Service:
                 why = "this server has no image encoder" if self.vision is None else None
                 if why is None:
                     try:
+                        src = item["source"]     # a URL is downloaded outside the FIFO, as prepare() does
+                        if isinstance(src, str) and src.startswith(("http://", "https://")):
+                            src = Vision.download(src)
                         with self.fifo:          # the encoder takes its turn with the requests (see below)
-                            self.vision.encode(item["source"])
+                            self.vision.encode(src)
                     except (ValueError, OSError) as e:
                         why = str(e)
                 if why is not None:
