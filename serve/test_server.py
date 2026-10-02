@@ -347,11 +347,11 @@ class ImageMarkers(unittest.TestCase):
         # own picture still fails
         class Refusing(self.FakeVision):
             def encode(self, source):
-                if "bad" in str(source):
+                if "webp" in str(source):
                     raise ValueError("this image format needs Pillow")
                 return super().encode(source)
         good = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
-        bad = {"type": "image", "source": {"type": "url", "url": "http://x/bad.webp"}}
+        bad = {"type": "image", "source": {"type": "base64", "media_type": "image/webp", "data": "UklG"}}
         tool_msgs = [{"role": "user", "content": "look"}, call,
                      {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [bad, good]}]}]
         with tempfile.TemporaryDirectory() as d:
