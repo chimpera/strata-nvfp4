@@ -121,6 +121,15 @@ bool refill_blocking() {
     return v;
 }
 
+// upstream #463, opt-in here: STRATA_ADAPT_WAIT=1 makes each decode window wait for the adaptive tier's copies before it
+// reads the residency table, so greedy decode repeats exactly (a resident expert runs the GPU kernel, a missed one the
+// CPU pool's, and they round differently).  Off by default: with this fork's tier (up to 192 swaps every 2 rounds) the
+// wait cost ~5% of decode (18.38 against 19.32 ms a round, 4 pairs), though the hit rate rose 0.898 -> 0.906.
+bool adapt_wait() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_ADAPT_WAIT"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
@@ -5928,7 +5937,7 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
-                apply_pending(false);
+                apply_pending(adapt_wait());
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
@@ -6773,7 +6782,7 @@ int main(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
-            apply_pending(false);
+            apply_pending(adapt_wait());
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
