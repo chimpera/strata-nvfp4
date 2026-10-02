@@ -122,6 +122,16 @@ bool refill_blocking() {
     return v;
 }
 
+// upstream #463, opt-in here: STRATA_ADAPT_WAIT=1 makes each decode window wait for the adaptive tier's copies before it
+// reads the residency table, so greedy decode repeats exactly (a resident expert runs the GPU kernel, a missed one the
+// CPU pool's, and they round differently).  Off by default: with this fork's tier (up to 192 swaps every 2 rounds) the
+// wait cost ~5% of decode (18.38 against 19.32 ms a round, 4 pairs), though the hit rate rose 0.898 -> 0.906.
+// (0.1.38 made the wait upstream's default, with STRATA_ADAPT_NOWAIT=1 for the A/B; here the no-wait is the default.)
+bool adapt_wait() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_ADAPT_WAIT"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
@@ -872,12 +882,6 @@ void mem_mark(const char* where) {
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
     std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
-}
-
-/// #463's A/B: STRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed (0.1.37)
-bool adapt_nowait() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_ADAPT_NOWAIT"); return e && e[0] == '1'; }();
-    return v;
 }
 
 int argmax(const std::vector<float>& v) {
@@ -6115,10 +6119,7 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
-                // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
-                // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
-                // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
-                apply_pending(!adapt_nowait());
+                apply_pending(adapt_wait());
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
@@ -6994,10 +6995,7 @@ int main(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
-            // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
-            // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
-            // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
-            apply_pending(!adapt_nowait());
+            apply_pending(adapt_wait());
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
