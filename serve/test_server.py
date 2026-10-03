@@ -2985,8 +2985,14 @@ class ImageSources(unittest.TestCase):
 
             try:
                 f = str(Path(d) / "secret.png")
-                # a page on any site, no api_key (the default): text/plain needs no CORS preflight
+                # a page on any site, no api_key (the default): text/plain needs no CORS preflight - 0.1.38 refuses
+                # such a page outright (403)
                 page = {"Content-Type": "text/plain;charset=UTF-8", "Origin": "https://evil.example"}
+                status, b = post("/v1/chat/completions", f, page)
+                self.assertEqual(status, 403, b)
+                # a page cors_origins lets in (here every page) may send JSON, and still cannot name a file
+                svc.cors_origins = ["*"]
+                page = {"Content-Type": "application/json", "Origin": "https://evil.example"}
                 for path in ("/v1/chat/completions", "/v1/messages"):
                     for src in (f, "file://" + f):
                         with self.subTest(path=path, src=src):
