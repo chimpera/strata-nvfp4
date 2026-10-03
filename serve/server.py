@@ -2477,11 +2477,11 @@ def make_handler(svc: Service):
                 origin not in svc.trusted_origins
 
         def _no_local_images(self, messages):
-            """A web page of another origin must not have a file on this computer read as an image: with no api_key
-            (the default) any page could send that request - as text/plain, which needs no CORS preflight and which
-            do_POST reads as JSON all the same - and the server read the file it named (the page only got no answer
-            to read, unless cors_origins let it).  data: and http(s) images are the page's own to send; files come
-            from Strata's own page, a trusted origin or a client that is no browser.  ValueError (a 400)."""
+            """A web page of another origin must not have a file on this computer read as an image.  Without an
+            api_key, _foreign_page refuses such a page unless cors_origins lets it in - and a page cors_origins lets
+            in (["*"]: every page) could name any file and, CORS allowing, read what the model says about it.  data:
+            and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
+            client that is no browser.  ValueError (a 400)."""
             if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://"))
                                               for src in images_of(messages)):
                 raise ValueError("a web page of another origin cannot have a file on this computer read as an "
