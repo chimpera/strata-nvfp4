@@ -9,6 +9,7 @@
 #include <immintrin.h>
 
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 
 #if defined(_WIN32)
@@ -24,6 +25,56 @@ namespace strata::kernels::cpu {
 namespace {
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
+}
+
+// CCD mode (STRATA_POOL_ORDER=ccd): reorder the worker representatives round-robin over NUMA
+// nodes (= CCDs on Threadripper/EPYC) so the FIRST n workers are node-balanced whatever n is.
+// Measured on a Threadripper PRO 5965WX (4 CCDs): within noise at >= 16 workers (the ~150 GB/s
+// platform read ceiling binds first), but below ~12 workers the sequential first-n selection
+// concentrates on the first node(s) and loses up to 2.8x (48.9 vs 139.3 GB/s at 12 workers).
+// Linux only (sysfs); a machine without node cpulists keeps the sequential order.
+void ccd_reorder(std::vector<int>& cores) {
+    if (const char* order = std::getenv("STRATA_POOL_ORDER"); order != nullptr &&
+        std::strcmp(order, "ccd") == 0 && !cores.empty()) {
+        std::vector<int> node_of(CPU_SETSIZE, -1);
+        int max_node = -1;
+        for (int n = 0; n < CPU_SETSIZE; ++n) {
+            char npath[96];
+            std::snprintf(npath, sizeof npath, "/sys/devices/system/node/node%d/cpulist", n);
+            if (std::FILE* f = std::fopen(npath, "r")) {
+                char line[512] = {0};
+                if (std::fgets(line, sizeof line, f)) {
+                    for (char* q = line; *q;) {
+                        char* e = nullptr;
+                        const long a = std::strtol(q, &e, 10);
+                        if (e == q) break;             // no more numbers
+                        q = e;
+                        long b = a;
+                        if (*q == '-') { b = std::strtol(q + 1, &e, 10); q = e; }
+                        for (long c = a; c <= b && c < CPU_SETSIZE; ++c) node_of[(size_t) c] = n;
+                        if (*q == ',') ++q;
+                    }
+                    max_node = n;
+                }
+                std::fclose(f);
+            }
+        }
+        if (max_node >= 0) {                            // no sysfs nodes -> keep the order above
+            std::vector<std::vector<int>> by_node((size_t) max_node + 1);
+            std::vector<int> unknown;
+            for (int cpu : cores)
+                (node_of[(size_t) cpu] >= 0 ? by_node[(size_t) node_of[(size_t) cpu]] : unknown).push_back(cpu);
+            cores.clear();
+            // round-robin: node 0's i-th representative, node 1's, ... then the unattributed
+            for (size_t i = 0;; ++i) {
+                bool any = false;
+                for (const auto& v : by_node)
+                    if (i < v.size()) { cores.push_back(v[i]); any = true; }
+                if (!any) break;
+            }
+            cores.insert(cores.end(), unknown.begin(), unknown.end());
+        }
+    }
 }
 }  // namespace
 
@@ -100,6 +151,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
                 topo.host_core = topo.worker_cores.front();
                 topo.worker_cores.erase(topo.worker_cores.begin());
             }
+            ccd_reorder(topo.worker_cores);
             return topo;
         }
 
@@ -133,6 +185,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         if (affinity != PoolAffinity::PCores) {
             for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
         }
+        ccd_reorder(topo.worker_cores);
         return topo;
     }
 #else
@@ -226,6 +279,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
             topo.host_core = topo.worker_cores.front();
             topo.worker_cores.erase(topo.worker_cores.begin());
         }
+        ccd_reorder(topo.worker_cores);
         return topo;
     }
 
@@ -253,6 +307,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     if (affinity != PoolAffinity::PCores) {
         for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
     }
+    ccd_reorder(topo.worker_cores);
     return topo;
 #endif
     return topo;
