@@ -279,6 +279,14 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
             topo.host_core = topo.worker_cores.front();
             topo.worker_cores.erase(topo.worker_cores.begin());
         }
+        // SMT siblings follow the primaries: a worker count at or below the
+        // physical-core count still lands one worker per physical core (the
+        // first entries are primaries); --pool-workers above that spreads over
+        // every logical CPU (48 on a 24-core SMT part) instead of leaving the
+        // extra workers unpinned.
+        for (const auto& cl : all_cpus) {
+            if (cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
+        }
         ccd_reorder(topo.worker_cores);
         return topo;
     }
