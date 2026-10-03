@@ -2130,7 +2130,8 @@ def make_handler(svc: Service):
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         body_read = False                                   # whether a handler took this request's body
-        DRAIN_LIMIT = 1 << 20                               # the most an unread body is read and dropped
+        DRAIN_LIMIT = 1 << 26                               # the most an unread body is read and dropped (64 MiB: a long
+                                                            # agent conversation or a picture is several MiB; the 5 s timeout bounds it)
 
         def log_message(self, fmt, *args):
             pass
