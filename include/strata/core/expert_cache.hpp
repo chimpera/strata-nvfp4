@@ -132,6 +132,16 @@ public:
     /// The slot range layer `l` may admit into under per-layer admission.  Exposed so a test can check it.
     void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
 
+    /// The working-set feature: reserve the LAST `n` slots ([alloc_top(), slots())) as the per-conversation
+    /// anticipation slice - excluded from admission (both forms), per-layer ranges, the prefill loan, the
+    /// elastic K/V and the adaptive tier's swaps; the serve loop fills it wholesale from the restored
+    /// conversation's ranked routing.  0 (the default) = no reservation, and alloc_top() == slots(), so every
+    /// consumer sees exactly today's arithmetic.  Set once at startup, right after open.
+    void set_reserved(int64_t n) { reserved_ = n > 0 ? n : 0; }
+    /// The exclusive top of every allocator that hands slots out (the first slot of the reservation).
+    int64_t alloc_top() const { return slots_ - (reserved_ < slots_ ? reserved_ : slots_); }
+    int64_t reserved() const { return reserved_; }
+
     /// The device address of one slot.
     uint8_t* device_slot(int32_t slot);
     const uint8_t* device_slot(int32_t slot) const;
@@ -176,6 +186,7 @@ private:
     std::size_t blocking_staging_bytes_ = 0;
 #endif
     uint8_t* base_ = nullptr;
+    int64_t reserved_ = 0;             ///< the anticipation slice's slot count (set_reserved)
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;

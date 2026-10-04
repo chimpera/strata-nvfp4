@@ -69,12 +69,21 @@ struct SavedConversation {
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     bool cvec = true;
+    // The working-set feature: this conversation's prompt routing, ranked (count desc, then flat index) and
+    // truncated to the anticipation slice's slot count - attached at park, seeded back into the serve loop's
+    // per-conversation heat at restore.  Empty unless --expert-anticipation is on.  Tens of KB against the
+    // image's ~GBs, which is why conversation_snapshot_bytes deliberately does not count it (the estimate
+    // drives make_room).
+    struct RoutedExpert { uint16_t layer, expert; uint32_t cnt;
+                          bool operator==(const RoutedExpert&) const = default; };
+    std::vector<RoutedExpert> experts;
 
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
                    kv.capacity() * sizeof(ConversationKv);
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
+        n += experts.capacity() * sizeof(RoutedExpert);
         return n;
     }
 };

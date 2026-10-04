@@ -337,6 +337,13 @@ struct Options {
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
     std::string expert_profile_save;
     double expert_profile_save_min = 10.0;
+    /// The working-set feature (--serve, 0 = off): reserve this many expert-cache slots at the top of the
+    /// arena as a per-conversation anticipation slice.  The serve loop counts prompt routing per conversation
+    /// (drained from the prefill paths), parks the ranked set with the conversation image, and on a restore
+    /// fills the slice with it while the park/restore copies run - turn N-1's routing covers ~87% of turn
+    /// N's pairs (measured, post-restore-slow-tail.md E7), so the recurring experts are resident instead of
+    /// re-streamed every turn.  STRATA_PF_ANTICIPATE overrides the value for A/B.
+    int64_t expert_anticipation = 0;
     /// R4.2d: **ON by default**, because the measurement is unambiguous and the alternative is known-broken.
     /// Without it, 17 of 10,562 layers had the hit work done when the pool returned; with it, 9,190.  The
     /// A/B arm is `--no-hit-poke`.
@@ -580,6 +587,11 @@ void usage() {
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
                  "                       0 = on QUIT only) between requests; start from it with --expert-profile P\n"
+                 "  --expert-anticipation N  --serve: reserve N expert-cache slots as a per-conversation\n"
+                 "                       anticipation slice; the conversation's own ranked prompt routing (parked\n"
+                 "                       with it, restored into it) fills the slice at each restore so the next\n"
+                 "                       turn's experts are resident instead of streamed (0 = off, the default;\n"
+                 "                       STRATA_PF_ANTICIPATE overrides for A/B)\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -1337,6 +1349,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
+        else if (a == "--expert-anticipation") o.expert_anticipation = std::atoll(next("--expert-anticipation"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
@@ -4923,6 +4936,27 @@ int main(int argc, char** argv) {
         // parked image by park_current.  Turn N-1's routing covers ~87% of turn N's (layer, expert) pairs and
         // the conversation's union ~94% (measured: post-restore-slow-tail.md E7, realistic text).
         std::vector<int32_t> conv_heat;
+        // the resolved anticipation slice size (0 = off): --expert-anticipation, STRATA_PF_ANTICIPATE overrides
+        const int64_t anticipation_slots = [&o] {
+            const char* v = std::getenv("STRATA_PF_ANTICIPATE");
+            return v != nullptr ? std::atoll(v) : o.expert_anticipation;
+        }();
+        // the conversation's ranked routing: count desc, then flat index, truncated to the slice's slot count
+        auto rank_experts = [&g](const std::vector<int32_t>& heat, size_t cap) {
+            std::vector<strata::core::SavedConversation::RoutedExpert> out;
+            if (cap == 0 || heat.empty()) return out;
+            std::vector<std::pair<int32_t, size_t>> by_count;
+            for (size_t i = 0; i < heat.size(); ++i)
+                if (heat[i] > 0) by_count.emplace_back(heat[i], i);
+            std::sort(by_count.begin(), by_count.end(), [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            if (by_count.size() > cap) by_count.resize(cap);
+            out.reserve(by_count.size());
+            for (const auto& [cnt, flat] : by_count)
+                out.push_back({(uint16_t) (flat / g.n_expert), (uint16_t) (flat % g.n_expert), (uint32_t) cnt});
+            return out;
+        };
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
@@ -4980,6 +5014,9 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                // the working set rides along: the conversation's ranked prompt routing, capped to the slice
+                // (tens of KB - the estimate above deliberately ignores it)
+                if (anticipation_slots > 0) image.experts = rank_experts(conv_heat, (size_t) anticipation_slots);
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
@@ -5682,6 +5719,12 @@ int main(int argc, char** argv) {
                 live_imgs = std::move(incoming->live.imgs);
                 checks = std::move(incoming->checkpoints);
                 cvec_cached = incoming->cvec;
+                // the working set comes back with the image: seed the live accumulator (bounds-checked against
+                // this run's geometry - a foreign image must not index out of range)
+                conv_heat.assign((size_t) g.n_layers * g.n_expert, 0);
+                for (const auto& re : incoming->experts)
+                    if (re.layer < g.n_layers && re.expert < g.n_expert)
+                        conv_heat[(size_t) re.layer * g.n_expert + re.expert] = (int32_t) re.cnt;
                 resume = parked.tokens;
                 from_live = parked.live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr)
@@ -5724,6 +5767,7 @@ int main(int argc, char** argv) {
                     cudaStreamSynchronize(st->stream);
                 }
                 checks.clear();
+                conv_heat.clear();   // a fresh conversation starts with an empty working set
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;

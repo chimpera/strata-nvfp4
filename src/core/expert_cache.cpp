@@ -315,9 +315,11 @@ void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) cons
     lo = 0;
     hi = 0;
     if (n_layers_ <= 0 || slots_ <= 0 || layer < 0 || layer >= n_layers_) return;
-    const int64_t q = slots_ / n_layers_;
+    // per-layer quotas divide the ADMISSIBLE range, never the anticipation slice at its top
+    const int64_t top = alloc_top();
+    const int64_t q = top / n_layers_;
     lo = layer * q;
-    hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;
+    hi = (layer == n_layers_ - 1) ? top : (layer + 1) * q;
 }
 
 int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
@@ -340,7 +342,7 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
         ++admitted_;
         return residency_[at];
     }
-    if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
+    if (next_free_ >= alloc_top()) return kNotResident;   // full: no eviction, deliberately - see the header
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
 }

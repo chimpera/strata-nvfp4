@@ -209,5 +209,27 @@ int main() {
         check(!disabled.put(image({1,2,3})) && !no_slots.put(image({1,2,3})), "disabled cache stores nothing");
         check(disabled.best(a,{},true).tokens == 0, "disabled cache has no matches");
     }
+    {
+        // the working-set feature: the ranked routing rides along on the image, counted by bytes(), and comes
+        // back out of take() exactly as parked
+        ConversationCache cache(1 << 20, 4);
+        SavedConversation parked = image({5, 6, 7});
+        parked.experts = {{3, 411, 900}, {0, 7, 42}, {47, 511, 1}};
+        const size_t with_experts = parked.bytes();
+        check(with_experts > image({5, 6, 7}).bytes(), "bytes() counts the routed-expert vector");
+        const auto want = parked.experts;
+        cache.put(std::move(parked));
+        const std::vector<int32_t> prompt = {5, 6, 7, 9};
+        SavedConversation back = cache.take(cache.best(prompt, {}, true).index);
+        check(back.experts == want, "the ranked routing survives the park/take roundtrip");
+        back.experts.clear();
+        back.experts.shrink_to_fit();
+        check(back.bytes() < with_experts, "bytes() follows a cleared working set");
+        SavedConversation bare = image({8, 9});
+        const size_t bare_bytes = bare.bytes();
+        bare.experts.reserve(4096);
+        check(bare.bytes() - bare_bytes == 4096 * sizeof(SavedConversation::RoutedExpert),
+              "bytes() charges the vector's capacity");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
