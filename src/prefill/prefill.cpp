@@ -1628,6 +1628,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 m.stage_live[sl] = true;
                 stats_.ms_experts_host += ms_since(th);
                 ++stats_.experts_streamed;
+                stats_.bytes_experts += (int64_t) bytes;
                 ++issued;
             }
         };
@@ -1642,7 +1643,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::atomic<size_t> a_issued{0}, a_consumed{0};
         std::atomic<bool> a_stop{false};
         double iss_ms = 0;
-        int64_t iss_streamed = 0, iss_dma = 0;
+        int64_t iss_streamed = 0, iss_dma = 0, iss_bytes = 0;
         std::thread issuer;
         struct IssuerJoin {
             std::atomic<bool>* stop;
@@ -1675,6 +1676,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     m.stage_live[sl] = true;
                     iss_ms += ms_since(th);
                     ++iss_streamed;
+                    iss_bytes += (int64_t) bytes;
                     a_issued.store(idx + 1, std::memory_order_release);
                 }
             });
@@ -2467,6 +2469,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
                             ++stats_.experts_streamed;
+                            stats_.bytes_experts += (int64_t) lay.blob_bytes(l);
                             return true;
                         };
                         // In the streamed walk an MMQ group is gathered in ONE launch, after ONE wait on its last
@@ -2829,6 +2832,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             issuer.join();
             stats_.ms_experts_host += iss_ms;
             stats_.experts_streamed += iss_streamed;
+            stats_.bytes_experts += iss_bytes;
             stats_.experts_dma += iss_dma;
         }
         stats_.tokens += T;
@@ -2922,6 +2926,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         }
         std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
                      (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
+        std::fprintf(stderr, "strata prefill timing: streamed %lld experts, %.2f GiB host->device\n",
+                     (long long) stats_.experts_streamed, (double) stats_.bytes_experts / 1073741824.0);
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);

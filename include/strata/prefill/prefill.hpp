@@ -31,6 +31,7 @@ struct PrefillStats {
     double ms_total = 0;
     double ms_experts_host = 0;     ///< host time staging non-resident experts
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
+    int64_t bytes_experts = 0;      ///< their bytes - against `wait copy`, this splits transfer time from pipeline
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     double ms_ple = 0;
