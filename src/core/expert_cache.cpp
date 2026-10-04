@@ -177,6 +177,11 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     }
 
     const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
+    // +4 KB past the last slot (covered by the zeroing memset below): the prefill MMQ path reads resident
+    // experts straight from their slots, and its tile loaders run up to one 256-value tile past a matrix
+    // whose row length is not a multiple of it (the NVFP4 down product: 640 values).  Mid-arena that reads
+    // the next slot's bytes and meets zero-padded activations; the LAST slot would read past the allocation.
+    const uint64_t want_guarded = want + 4096;
 
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
     //
@@ -201,8 +206,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 
     if (g_cache_vmm && vmm_available()) {
         // the elastic K/V: every chunk mapped now; the K/V may later take some of them (and give them back)
+        // (the +4 KB guard is implicit here: reserve() rounds up to whole 2 MiB chunks)
         auto r = std::make_unique<VmmRange>();
-        if (!r->reserve(want) || !r->map_range(0, r->chunks(), [] { return (VmmChunk) 0; })) {
+        if (!r->reserve(want_guarded) || !r->map_range(0, r->chunks(), [] { return (VmmChunk) 0; })) {
             char buf[256];
             std::snprintf(buf, sizeof buf, "ExpertCache: mapping %.2f GiB of VRAM failed: out of memory",
                           (double) want / 1073741824.0);
@@ -211,7 +217,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
         base_ = r->base();
         vmm_ = std::move(r);
-    } else if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
+    } else if (cudaMalloc((void**) &base_, (size_t) want_guarded) != cudaSuccess) {
         base_ = nullptr;
         char buf[256];
         std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
@@ -221,7 +227,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
+    if (cudaMemset(base_, 0, (size_t) want_guarded) != cudaSuccess) {
         err = "ExpertCache: cudaMemset of the slot arena failed";
         close();
         return false;

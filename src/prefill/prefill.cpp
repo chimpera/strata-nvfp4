@@ -462,6 +462,12 @@ struct Prefill::Impl {
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     float *Xscale = nullptr, *Hscale = nullptr, *grp_tail = nullptr;   // NVFP4: activation scales, expert tails
+    // the resident-direct path (STRATA_PF_RESIDENT_DIRECT): a group's pointer tables - gate/up, down and tail
+    // bases, MMQ_GROUP entries each - in one pinned host block per parity and one device block; one async copy
+    // per group on the compute stream, ordered after the previous group's kernels
+    uint8_t* rd_tab_host[2] = {nullptr, nullptr};
+    uint8_t* rd_tab_dev = nullptr;
+    cudaEvent_t rd_ev[2] = {};
     float* row_sd = nullptr;          // NVFP4 in MMQ: each Dm row's s_down, applied by the combine as it reads the row
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
@@ -570,6 +576,10 @@ void Prefill::release() {
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
+    for (int b = 0; b < 2; ++b) {
+        if (impl_->rd_tab_host[b]) cudaFreeHost(impl_->rd_tab_host[b]);
+        if (impl_->rd_ev[b]) cudaEventDestroy(impl_->rd_ev[b]);
+    }
     for (void* p : impl_->owned) cudaFree(p);
 }
 
@@ -864,6 +874,17 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        m.rd_tab_dev = o.take<uint8_t>(3 * MMQ_GROUP * sizeof(void*), ok);
+        for (int b = 0; b < 2; ++b) {
+            if (m.rd_tab_host[b] == nullptr)
+                m.rd_tab_host[b] = (uint8_t*) (cudaHostAlloc((void**) &m.rd_tab_host[b], 3 * MMQ_GROUP * sizeof(void*),
+                                                             cudaHostAllocDefault) == cudaSuccess ? m.rd_tab_host[b] : nullptr);
+            if (m.rd_tab_host[b] != nullptr && m.rd_ev[b] == nullptr &&
+                cudaEventCreateWithFlags(&m.rd_ev[b], cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                m.rd_ev[b] = nullptr;   // the tables stay unusable; the resident-direct eligibility declines
+            }
+        }
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
@@ -2459,11 +2480,60 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
                             return v == nullptr || std::atoi(v) != 0;
                         }();
-                        const bool group_gather = group_env && stream_all && use_mmq && lay.native &&
+                        // the working-set feature's compute half (B2): resident experts read straight from their
+                        // cache slots - no gather.  STRATA_PF_RESIDENT_DIRECT (default off).  The eligibility is per
+                        // layer and asserts the NVFP4 blob's planes ARE the MMQ images the pointer tables index:
+                        // up_off == mmq_gub/2 (the gate half ends where the gu image's first half does) and
+                        // down_off == mmq_gub (the down image starts at the gu image's end), with a 16-byte tail.
+                        // W4A8 only (the direct TU compiles the int8 path), one GPU (no peer, no layer-split stage).
+                        static const bool direct_env = [] {
+                            const char* v = std::getenv("STRATA_PF_RESIDENT_DIRECT");
+                            return v != nullptr && std::atoi(v) != 0;
+                        }();
+                        const char* direct_why = nullptr;   // the first failed check, for the one-time log below
+                        const bool resident_direct = direct_env && use_mmq && lay.native && !m.pp && next_ == nullptr &&
+                                                     m.rd_tab_dev != nullptr && m.rd_tab_host[0] != nullptr &&
+                                                     m.rd_tab_host[1] != nullptr && m.rd_ev[0] != nullptr &&
+                                                     m.rd_ev[1] != nullptr &&
+                                                     mmq::nvfp4_mode() == mmq::Nvfp4Mode::W4A8 &&
+                                                     [&] {
+                                                         const auto& f = lay.fmt[(size_t) l];
+                                                         const bool ok = mmq::is_nvfp4(f.gu_type) && mmq::is_nvfp4(f.d_type) &&
+                                                                         f.tail_off != 0 && f.up_off == mmq_gub / 2 &&
+                                                                         f.down_off == mmq_gub;
+                                                         if (!ok && direct_why == nullptr)
+                                                             direct_why = "the blob planes are not the MMQ images";
+                                                         return ok;
+                                                     }();
+                        if (direct_env && !resident_direct && direct_why == nullptr)
+                            direct_why = !use_mmq ? "this layer keeps the FP16 path" : !lay.native ? "not a native pack" :
+                                         m.pp ? "a peer GPU holds part of the experts" : next_ != nullptr ? "a layer split" :
+                                         m.rd_tab_dev == nullptr || m.rd_tab_host[0] == nullptr || m.rd_tab_host[1] == nullptr
+                                             ? "no pointer-table buffers" :
+                                         mmq::nvfp4_mode() != mmq::Nvfp4Mode::W4A8 ? "not W4A8" : "unmet";
+                        if (direct_env) {
+                            static int said = 0;   // once per run: what the direct path did with the first layer
+                            if (resident_direct && said == 0) {
+                                ++said;
+                                std::fprintf(stderr, "strata prefill: resident experts compute straight from their cache "
+                                                     "slots (layer %lld eligible; STRATA_PF_RESIDENT_DIRECT)\n",
+                                             (long long) l);
+                            } else if (!resident_direct && said == 0) {
+                                ++said;
+                                std::fprintf(stderr, "strata prefill: STRATA_PF_RESIDENT_DIRECT set but declined for "
+                                                     "layer %lld: %s\n", (long long) l, direct_why ? direct_why : "unmet");
+                            }
+                        }
+                        // the group gather's layout assumes slot q is expert q's - the compacted streamed slots
+                        // of the direct path break that, so it stands down (one gather per streamed expert)
+                        const bool group_gather = group_env && stream_all && use_mmq && lay.native && !resident_direct &&
                                                   MMQ_GROUP <= mmq::kGatherGroupMax;
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
+                        // resident-direct: groups issued so far (the host block's parity) and the streamed experts
+                        // compacted into the current group's slots
+                        int rd_groups = 0, rd_streamed = 0;
                         // `zero`: the MMQ tail zeroed after the gathered experts (the group's last flush)
                         auto flush = [&](size_t zero) {
                             if (gg.n <= gg.first) return;
@@ -2503,6 +2573,72 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 const size_t q = j % MMQ_GROUP;
                                 // the group's last expert also zeroes the MMQ tail after its slot (see MMQ_TAIL)
                                 const bool last_of_group = q + 1 == MMQ_GROUP || j + 1 == order.size();
+                                if (resident_direct) {
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    uint8_t* host = m.rd_tab_host[rd_groups & 1];
+                                    if (q == 0) {   // first expert of a group: the block's previous user (two groups
+                                        if (rd_groups >= 2)   // back) must have had its copy picked up by now
+                                            cudaEventSynchronize(m.rd_ev[rd_groups & 1]);
+                                        rd_streamed = 0;
+                                    }
+                                    const uint8_t** tab_gu = (const uint8_t**) host;
+                                    const uint8_t** tab_dn = (const uint8_t**) (host + MMQ_GROUP * sizeof(void*));
+                                    const uint8_t** tab_tail = (const uint8_t**) (host + 2 * MMQ_GROUP * sizeof(void*));
+                                    if (slot >= 0) {   // streamed: gathered into the group's next COMPACTED slot
+                                        mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2,
+                                                           blob_dev + f.down_off, mmq_db,
+                                                           m.grp_gu + rd_streamed * mmq_gub, m.grp_d + rd_streamed * mmq_db,
+                                                           m.cs, f.tail_off ? blob_dev + f.tail_off : nullptr,
+                                                           f.tail_off ? m.grp_tail + q * 4 : nullptr, 0);
+                                        tab_gu[q] = m.grp_gu + rd_streamed * mmq_gub;
+                                        tab_dn[q] = m.grp_d + rd_streamed * mmq_db;
+                                        ++rd_streamed;
+                                    } else {   // resident: the slot's planes are the MMQ images (eligibility checked)
+                                        tab_gu[q] = blob_dev;
+                                        tab_dn[q] = blob_dev + f.down_off;
+                                        tab_tail[q] = blob_dev;   // its tail is gathered at the group's end
+                                    }
+                                    if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                    if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                    // the group's products, straight from the pointer table
+                                    if (rd_streamed > 0) {   // the MMQ tail after the last streamed slot
+                                        cudaMemsetAsync(m.grp_gu + (size_t) rd_streamed * mmq_gub, 0, MMQ_TAIL, m.cs);
+                                        cudaMemsetAsync(m.grp_d + (size_t) rd_streamed * mmq_db, 0, MMQ_TAIL, m.cs);
+                                    }
+                                    const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                                    const int ngx = (int) (q + 1);
+                                    const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
+                                    int64_t maxr = 0;
+                                    for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                                    cudaMemcpyAsync(m.rd_tab_dev, host, (size_t) 3 * ngx * sizeof(void*),
+                                                    cudaMemcpyHostToDevice, m.cs);
+                                    cudaEventRecord(m.rd_ev[rd_groups & 1], m.cs);
+                                    ++rd_groups;
+                                    mmq::gather_tails((const void* const*) (m.rd_tab_dev + 2 * MMQ_GROUP * sizeof(void*)),
+                                                      f.tail_off, m.grp_tail, ngx, m.cs);
+                                    pt.mark(kPfGemmGU, cs);
+                                    mmq::Product gu;
+                                    gu.w = m.grp_gu; gu.w_ptrs = (const void* const*) m.rd_tab_dev; gu.type = mmq_gt;
+                                    gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                                    gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
+                                    gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                    gu.y_scale = nullptr;   // W4A8 (eligibility): int8 activations, no row scales
+                                    m.mmq_ctx->run(gu, m.cs);
+                                    mmq::swiglu_scaled(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, m.bounds_dev + j0, ngx,
+                                                       m.grp_tail, r0, m.cs);
+                                    pt.mark(kPfGemmD, cs);
+                                    mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                                    mmq::Product dn;
+                                    dn.w = m.grp_d; dn.w_ptrs = (const void* const*) m.rd_tab_dev + MMQ_GROUP;
+                                    dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
+                                    dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
+                                    dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
+                                    dn.ld_dst = N;
+                                    dn.y_scale = nullptr;
+                                    m.mmq_ctx->run(dn, m.cs);
+                                    mmq::down_row_scales(m.row_sd + r0, dn.bounds, ngx, m.grp_tail, nr, m.cs);
+                                    return true;
+                                }
                                 if (group_gather) {
                                     gg.blob[q] = blob_dev;
                                     gg.n = (int) q + 1;

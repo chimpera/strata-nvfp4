@@ -131,6 +131,15 @@ __global__ void down_row_scales_kernel(float* __restrict__ sd, const int32_t* __
     sd[r] = tails[4 * q + 2];
 }
 
+// the working-set feature: each expert's 16-byte NVFP4 tail from its own device pointer - a resident expert's
+// cache slot, or a streamed expert's staging slot - into the group's tail row, one launch for the whole group.
+__global__ void gather_tails_kernel(const uint8_t* const* __restrict__ blobs, int64_t tail_off,
+                                    float4* __restrict__ tail_dst, int n) {
+    const int q = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    // a null entry is a streamed expert, whose tail its own gather already wrote next to its group slot
+    if (q < n && blobs[q] != nullptr) tail_dst[q] = *(const float4*) (blobs[q] + tail_off);
+}
+
 __global__ void iota_kernel(int32_t* dst, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = (int32_t) i;
@@ -151,6 +160,8 @@ void quantize_nvfp4_w4a4(const float* x, const int32_t* ids, void* xq, float* ys
                          int64_t ld, int64_t rows, int64_t padded, cudaStream_t s);
 
 bool built() { return true; }
+
+bool is_nvfp4(int t) { return (ggml_type) t == GGML_TYPE_NVFP4; }
 
 Nvfp4Mode nvfp4_mode() {
     static const Nvfp4Mode m = [] {
@@ -408,6 +419,13 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     if (rows <= 0) return;
     swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
     ck(cudaGetLastError(), "swiglu");
+}
+
+void gather_tails(const void* const* blobs, size_t tail_off, float* tail_dst, int n, void* stream) {
+    if (n <= 0) return;
+    gather_tails_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>((const uint8_t* const*) blobs,
+                                                                     (int64_t) tail_off, (float4*) tail_dst, n);
+    ck(cudaGetLastError(), "gather_tails");
 }
 
 void iota(int32_t* dst, int64_t n, void* stream) {

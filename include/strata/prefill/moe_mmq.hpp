@@ -12,6 +12,8 @@ namespace strata::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
+/// `t` is ggml's NVFP4 (the resident-direct path's one eligible weight type).
+bool is_nvfp4(int t);
 /// MMQ covers this ggml type (the i-quants and Q2_0 the packs use, Q8_0, NVFP4 unless fp16, and in a CUDA build
 /// with STRATA_MMQ_KQUANTS the Q4_K / Q5_K / Q5_1 of Unsloth's UD-Q4_K_XL; IQ1_M is not covered).
 bool supported(int ggml_type);
@@ -115,6 +117,10 @@ void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const 
                    const float* tails, int64_t row0, void* stream);
 /// sd[r] = the s_down of row r's expert (group-local bounds): the combine applies it as it reads the row.
 void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream);
+/// The resident-direct path's tails: expert q's 16-byte NVFP4 tail from `blobs[q] + tail_off` (a cache slot or a
+/// staging slot, on the device) to `tail_dst + 4 q` - what the per-expert gather writes for streamed experts,
+/// done in one launch for the experts that were never gathered.
+void gather_tails(const void* const* blobs, size_t tail_off, float* tail_dst, int n, void* stream);
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
