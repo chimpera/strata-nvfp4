@@ -367,6 +367,21 @@ for name, seed in (("a", 0), ("b", 1000)):
    field; enables per-lineage attribution, cache_report.py-style tooling).
 4. Expectancy eviction policy (house 0014 port): tiered eviction instead of
    LRU; complements §8.
+5. **The fork's first vendored llama.cpp edit — DONE 2026-10-04 (B1)**:
+   `third_party/llama-mmq-ptr-table.patch` (40 insertions in
+   `ggml/src/ggml-cuda/mmq.cuh`), applied to the FetchContent checkout at
+   configure time (CMakeLists.txt, reverse-check first so re-runs are no-ops).
+   Two parts: (a) STRATA_MMQ_PTR_TABLE — one weight base pointer per expert
+   for `src/prefill/mmq_direct.cu`, ifdef-guarded so every other TU compiles
+   the gathered-image kernel of today (mmq_args gains one unconditional
+   trailing `x_ptrs` field so the struct is one type everywhere); (b) an ids
+   overread guard on the three `ids_dst_shared` fills — a partial J-tile at
+   the last expert read up to J-1 entries past `col_high` (compute-sanitizer
+   on the new test caught it in the STOCK kernel; values were unused, but
+   production's `ids_identity` arena read into neighbors every launch).
+   Upstreamable as-is. Regenerate against a moved GIT_TAG with:
+   edit `third_party/llama.cpp` (the pinned reference checkout), `git diff >
+   third_party/llama-mmq-ptr-table.patch`, `git checkout --` it back.
 
 ## 11. Open questions
 

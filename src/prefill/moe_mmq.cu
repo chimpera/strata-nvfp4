@@ -142,6 +142,8 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 // mmq_nvfp4_w4a8.cu: mmq.cuh's int8 NVFP4 path, compiled for this GPU with Blackwell's FP4 MMA hidden
 void run_nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
+// mmq_direct.cu: the same int8 path with STRATA_MMQ_PTR_TABLE - one base pointer per expert, no gathered image
+void run_direct(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
 // mmq_nvfp4_w4a4.cu (the one unit built for 12xa): FP4 x FP4 and its activation quantizer, if this card runs it
 bool w4a4_available();
 void run_nvfp4_w4a4(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
@@ -300,9 +302,9 @@ void Context::run(const Product& p, void* stream) {
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
-                        p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
+                        p.n, p.n, p.w_ptrs ? 0 : (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
+                        p.max_rows, p.max_rows, (const char* const*) p.w_ptrs};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {
@@ -326,6 +328,7 @@ void Context::run(const Product& p, void* stream) {
 #if !defined(GGML_USE_HIP)   // NVFP4: CUDA only (no HIP instance, no W4A8 unit)
         case GGML_TYPE_NVFP4:
             if (fp4_activations(t)) run_nvfp4_w4a4(ctx, a, s);
+            else if (p.w_ptrs != nullptr) run_direct(ctx, a, s);
             else run_nvfp4_w4a8(ctx, a, s);
             break;
 #endif

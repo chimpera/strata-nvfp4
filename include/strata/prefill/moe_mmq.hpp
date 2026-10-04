@@ -52,6 +52,11 @@ void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const f
 /// `total_rows`: the rows of xq; `max_rows`: the most rows one expert has (the launch grid).
 struct Product {
     const void* w = nullptr;
+    /// The per-expert weight bases, NVFP4 W4A8 only (mmq_direct.cu): `n` device pointers, expert e's matrix at
+    /// `w_ptrs[e]` with the same row layout the gathered image would have.  Non-null switches the launch from the
+    /// gathered image at `w` (which is then not read) to llama.cpp's pointer-table kernel - the resident experts
+    /// compute straight out of their cache slots and only the streamed ones are gathered.
+    const void* const* w_ptrs = nullptr;
     int type = -1;
     int64_t w_rows = 0, w_cols = 0;
     size_t expert_bytes = 0;

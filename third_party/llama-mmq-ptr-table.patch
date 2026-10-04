@@ -1,0 +1,143 @@
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 6923f3510..7ce9563d5 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -950,6 +950,20 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+ 
+ // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
+ 
++// STRATA_MMQ_PTR_TABLE (the strata-nvfp4 fork): read each expert's weights through its own base pointer,
++// x_ptrs[zt], instead of one gathered image at x. The caller passes stride_channel_x = 0 (channel_ratio stays
++// 1), so offset_x's per-expert term vanishes and only it*I*stride_row_x remains. Every TU that does not define
++// STRATA_MMQ_PTR_TABLE compiles exactly the gathered-image kernel of today.
++#if defined(STRATA_MMQ_PTR_TABLE)
++#define STRATA_MMQ_PTRS_ARG  , const char * const * x_ptrs
++#define STRATA_MMQ_PTRS_ARGV , args.x_ptrs
++#define STRATA_MMQ_XBASE(zt) x_ptrs[zt]
++#else
++#define STRATA_MMQ_PTRS_ARG
++#define STRATA_MMQ_PTRS_ARGV
++#define STRATA_MMQ_XBASE(zt) x
++#endif
++
+ template <ggml_type type, int J, bool fallback>
+ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+ static __global__ void mul_mat_q(
+@@ -959,13 +973,16 @@ static __global__ void mul_mat_q(
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const uint3 ntx) {
++        const uint3 ntx STRATA_MMQ_PTRS_ARG) {
+ 
+     // Skip unused template specializations for faster compilation:
+     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+         NO_DEVICE_CODE;
+         return;
+     }
++#if defined(STRATA_MMQ_PTR_TABLE)
++    (void) x;   // STRATA_MMQ_PTR_TABLE: the per-tile base is x_ptrs[zt]; the parameter keeps one signature
++#endif
+ 
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+@@ -1034,7 +1051,9 @@ static __global__ void mul_mat_q(
+                     break;
+                 }
+ 
+-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
++                if (col_low + jt*J + j < col_high) {   // STRATA: a partial tile's tail columns run past this
++                    ids_dst_shared[j] = ids_dst[col_low + jt*J + j];   // expert's rows - never read them
++                }
+             }
+             __syncthreads();
+         }
+@@ -1054,7 +1073,7 @@ static __global__ void mul_mat_q(
+ 
+         constexpr bool fixup = false;
+         mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++            (STRATA_MMQ_XBASE(zt), offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+              stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+         return;
+@@ -1128,7 +1147,9 @@ static __global__ void mul_mat_q(
+                     break;
+                 }
+ 
+-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
++                if (col_low + jt*J + j < col_high) {   // STRATA: a partial tile's tail columns run past this
++                    ids_dst_shared[j] = ids_dst[col_low + jt*J + j];   // expert's rows - never read them
++                }
+             }
+             __syncthreads();
+         }
+@@ -1148,7 +1169,7 @@ static __global__ void mul_mat_q(
+ 
+         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
+         mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++            (STRATA_MMQ_XBASE(zt), offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+              stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ 
+@@ -1232,7 +1253,7 @@ static __global__ void mul_mat_q(
+ 
+     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
+     mul_mat_q_process_tile<type, J, fallback, fixup>
+-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++        (STRATA_MMQ_XBASE(zt), offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+          stride_row_x, ncols_y, stride_col_dst,
+          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ }
+@@ -1350,7 +1371,9 @@ static __global__ void mul_mat_q_stream_k_fixup(
+     const int col_diff = col_high - col_low;
+ 
+     for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
+-        ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
++        if (col_low + jt*J + j < col_high) {   // STRATA: as in mul_mat_q - never read ids past the expert's rows
++            ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
++        }
+     }
+     __syncthreads();
+ 
+@@ -1383,6 +1406,8 @@ struct mmq_args {
+     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
+     int64_t ncols_max;
+     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
++    const char * const * x_ptrs = nullptr; // STRATA (strata-nvfp4 fork): per-expert weight bases; read only by TUs
++                                           // that define STRATA_MMQ_PTR_TABLE (nullptr: the gathered image at x)
+ };
+ 
+ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
+@@ -1432,7 +1457,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-             ntx_fd);
++             ntx_fd STRATA_MMQ_PTRS_ARGV);
+         return;
+     }
+ 
+@@ -1461,7 +1486,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-         ntx_fd);
++         ntx_fd STRATA_MMQ_PTRS_ARGV);
+ 
+     if (!fixup_needed) {
+         return;
+@@ -1474,6 +1499,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+          ntx_fd);
+ }
+ 
++#if defined(STRATA_MMQ_PTR_TABLE)   // STRATA: the pointer-table hooks end with the launches
++#undef STRATA_MMQ_PTRS_ARG
++#undef STRATA_MMQ_PTRS_ARGV
++#undef STRATA_MMQ_XBASE
++#endif
++
+ template <ggml_type type, bool fallback>
+ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+     const int    id    = ggml_cuda_get_device();

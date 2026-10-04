@@ -877,6 +877,26 @@ if(STRATA_NATIVE_EXPERTS)
     if(NOT strata_llamacpp_POPULATED)
       FetchContent_Populate(strata_llamacpp)
     endif()
+    # STRATA (strata-nvfp4 fork): the pointer-table MMQ hooks src/prefill/mmq_direct.cu compiles mmq.cuh with
+    # (STRATA_MMQ_PTR_TABLE: one weight base pointer per expert, so resident experts read straight from their
+    # cache slots).  The diff against GIT_TAG lives in third_party/llama-mmq-ptr-table.patch - the record of the
+    # fork's one vendored edit; post-restore-slow-tail.md tracks it in the port queue.  Applied to the fetched
+    # checkout at configure time; the reverse check first makes re-runs and an already-patched tree no-ops.
+    execute_process(
+      COMMAND git -C ${strata_llamacpp_SOURCE_DIR} apply --reverse --check
+              ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-mmq-ptr-table.patch
+      RESULT_VARIABLE _strata_mmq_patch_state
+      ERROR_QUIET OUTPUT_QUIET)
+    if(NOT _strata_mmq_patch_state EQUAL 0)
+      execute_process(
+        COMMAND git -C ${strata_llamacpp_SOURCE_DIR} apply
+                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-mmq-ptr-table.patch
+        RESULT_VARIABLE _strata_mmq_patch_applied)
+      if(NOT _strata_mmq_patch_applied EQUAL 0)
+        message(FATAL_ERROR "third_party/llama-mmq-ptr-table.patch did not apply to the fetched llama.cpp "
+                            "(did GIT_TAG move? regenerate the patch against the new checkout)")
+      endif()
+    endif()
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
@@ -916,7 +936,7 @@ if(STRATA_NATIVE_EXPERTS)
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
-                src/prefill/mmq_nvfp4_w4a8.cu
+                src/prefill/mmq_nvfp4_w4a8.cu src/prefill/mmq_direct.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (docs/UNSLOTH_Q4.md; the dispatch
@@ -968,6 +988,11 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_fused_iq_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
       set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # the pointer-table MMQ (mmq_direct.cu) against the gathered image, bit for bit (exit 77 without a device)
+      add_executable(prefill_mmq_direct_test tests/cuda/prefill_mmq_direct_test.cpp)
+      target_link_libraries(prefill_mmq_direct_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_mmq_direct_test COMMAND prefill_mmq_direct_test)
+      set_tests_properties(prefill_mmq_direct_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endif()
     if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)
