@@ -113,6 +113,9 @@
         </div>
         <div class="st-card req-card">
           <div class="req-head"><span class="card-title">Recent requests</span>
+            <label class="muted small" title="Hide requests shorter than this in BOTH dimensions of the stats: read/prefill figures need at least this many fresh tokens read, write/decode figures at least this many written. 0 = show everything.">min tokens
+              <input id="req-min-tok" type="number" min="0" step="1" value="0" style="width:5.5em">
+            </label>
             <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div>
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">

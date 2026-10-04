@@ -176,6 +176,14 @@ function setPill(state, text) {
   $("pill-text").textContent = text;
 }
 
+// the "min tokens" filter: a request counts for READ figures when it read at least this many
+// fresh tokens (prompt_read), and for WRITE figures when it wrote at least this many — very
+// short reads (checkpoint-restore tails) and writes (one-line answers) otherwise drag the
+// per-request rates and averages around. 0 = no filter. Typed in the Monitor tab, remembered.
+let minTok = Number(localStorage.getItem("reqMinTok") || 0) || 0;
+const passRead = (r) => minTok <= 0 || (r.prompt_read ?? r.prompt_tokens ?? 0) >= minTok;
+const passWrite = (r) => minTok <= 0 || (r.output_tokens ?? 0) >= minTok;
+
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
@@ -191,6 +199,20 @@ function render(m) {
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "about") renderAbout(eng, hw, st);
+}
+
+// the filter input: apply immediately to whatever the last poll brought
+function wireMinTok() {
+  const el = $("req-min-tok");
+  if (!el) return;
+  el.value = minTok;
+  el.addEventListener("input", () => {
+    const v = Math.max(0, Number(el.value) || 0);
+    if (v === minTok) return;
+    minTok = v;
+    localStorage.setItem("reqMinTok", String(v));
+    if (lastMetrics) render(lastMetrics);
+  });
 }
 
 function renderTotals(t) {
@@ -230,12 +252,14 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
 
-  // the eight cards
-  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
+  // the eight cards — the last-request fallbacks honor the min-tokens filter per dimension
+  const lastW = requests.find(passWrite) || null;
+  const lastR = requests.find(passRead) || null;
+  const speed = live.state === "generating" ? live.tok_s : lastW ? lastW.decode_tok_s : null;
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
+            live.state === "generating" ? "Decode now" : lastW ? "Decode last request" : "Decode");
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
+                : lastR && lastR.prompt_ms > 0 ? Math.max(0, lastR.prompt_tokens - (lastR.reused || 0)) / (lastR.prompt_ms / 1000) : null;
   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
             live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
   spark("sp-speed", h.tok_s);
@@ -298,7 +322,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
-    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
+    const shown = requests.filter((r) => minTok <= 0 || passRead(r) || passWrite(r));
+    if (!shown.length) {
+      body.innerHTML = `<tr><td colspan="8" class="muted">All requests are under ${fmt(minTok)} tokens</td></tr>`;
+    } else {
+    body.innerHTML = shown.slice(0, reqShowAll ? shown.length : 12).map((r) => {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
@@ -307,6 +335,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
+    }
   }
   const all = $("req-all");
   kept = kept == null ? requests.length : kept;
@@ -977,4 +1006,5 @@ const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=..
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
 loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
+wireMinTok();
 poll();
