@@ -283,6 +283,15 @@ host-side routing isn't known at plan time. For real text that over-streams
 
 ## 8. Fix directions (ranked, fork-side, upstream-able)
 
+*(2026-10-04 postscript: 1 and 2 are BUILT (commits cee2509, 2566a60,
+0b591ef) and the live A/B measured them — neither moves the wall on the
+c524 preset, and the mechanism is now understood: the D2D gather was
+overlapped with the H2D miss stream (full-duplex PCIe), and the profile
+already covers repo-text conversations so the slice's thrash guard
+correctly skips. The wall is bounded by the miss stream itself — the
+remaining lever is pinning/source speed, exactly E9's +5-16%. Full
+numbers: bench/results/2026-10-04-expert-residency/README.md.)*
+
 1. **Pre-gathered resident slots (new top pick — mechanism-independent).**
    Store resident experts in MMQ group layout (gather ONCE at fill/admission
    instead of per use). Kills the ~500 ms/turn unconditional gather for every
@@ -433,6 +442,17 @@ for name, seed in (("a", 0), ("b", 1000)):
   interactive path's belt-and-braces re-check, and three loan-size log
   arithmetic sites → `alloc_top()`. Lesson recorded: the parity gate must be
   run once with the feature's env override set, not only default-off.
+- **The live A/B on c524 (the maintenance interval's measurement)**: 4 arms
+  over two interleaved conversations (notes/ab_interleave_probe.py, the only
+  shape that parks/restores per request). Baseline turns 1.92-1.98 s;
+  anticipation 2048 → 2.14-2.19 s (no swap ever fired - the 6,602-slot
+  profile covers ≥90% of repo-text conversations, so the thrash guard skips;
+  the regression is the 2,048 profile slots it cost); resident-direct → wall
+  unchanged (the ~370 ms/turn of gathers were overlapped with the ~550-800 ms
+  H2D miss stream; phases move, gemms +8-17% from the indirect bases).
+  Preset restored to defaults; both flags stay opt-in. The features are
+  correct (bit-exact through every gate) - the expected win was wrong, not
+  the code. bench/results/2026-10-04-expert-residency/README.md.
 - **The strict parity check vs residency changes, classified** (control
   experiment): with the slice on, the gate's A/B/A continuation emits
   IDENTICAL tokens (initial request bit-identical too), but

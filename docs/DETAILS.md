@@ -414,6 +414,23 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
+**Per-conversation expert anticipation + resident experts straight from their slots (opt-in, engine 0.1.38-fork,
+2026-10-04):** two independent switches, both default off and both byte-exact against the plain path (the
+conversation-cache parity gate passes with either on - the pointer path computes bit-identical state).
+`--expert-anticipation N` (`--serve`) reserves the expert cache's last N slots; every prompt's routing is counted
+per conversation and parked with it, and each restore fills the slice from that ranking on a side stream hidden in
+the park/restore window (measured 95 ms for 388 experts on an RTX 3090). It pays only when the shipped profile does
+not already cover the conversation: on an RTX 5090 with a 6,602-slot profile over repo-text conversations, the
+built-in thrash guard (skip when ≥90% of the wanted experts are already resident) skipped every swap and the
+reservation only cost profile slots - measured 1.92-1.98 s baseline turns vs 2.14-2.19 s with it on.
+`STRATA_PF_RESIDENT_DIRECT=1` (NVFP4 W4A8 packs, one GPU) computes the prompt path's resident experts through a
+pointer-table variant of llama.cpp's MMQ kernel instead of gathering every routed expert into a contiguous buffer
+first - about 370 ms less D2D traffic per 2k-fresh-token turn on that 5090, at ~35 ms more kernel time (indirect
+weight bases). The turn wall did not change there because the gather ran overlapped with the H2D streaming of the
+missed experts (full-duplex PCIe); it helps when misses are few or the copy engine is contended. The measurements:
+`bench/results/2026-10-04-expert-residency/README.md`; the kernel changes ride one recorded vendored patch,
+`third_party/llama-mmq-ptr-table.patch`.
+
 **Keep what the expert cache learned across restarts (opt-in, engine 0.1.36, #477):** a start fills the GPU's expert
 cache from the shipped profile, and the adaptive tier (`--adapt-every`) then moves in the experts your requests use.
 With `"expert_profile_save": "expert-profile-learned.bin"` in `strata-<model>.json` the engine saves that as a
@@ -892,7 +909,9 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
   tokens per pass on average. When the reply repeats the context (code edits, quoted text), **prompt lookup** (engine
   0.1.7) drafts up to 5 tokens from the earlier copy, but only where its measured acceptance and cost say it pays:
   code edits 6-11% faster, other text unchanged. The drafts are checked like the MTP's, so the output is the same.
-- **Prompts** are processed in 2,048-token chunks with the experts streamed to the GPU over PCIe.
+- **Prompts** are processed in chunks with the experts streamed to the GPU over PCIe; the resident ones are copied
+  into the prompt path's group buffers (or, with `STRATA_PF_RESIDENT_DIRECT=1`, read straight from their cache
+  slots).
 
 The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
 
