@@ -281,6 +281,51 @@ expert of every layer — routed or not (plan at prefill.cpp:1537) — because
 host-side routing isn't known at plan time. For real text that over-streams
 ~5×; it hides only at large chunk sizes (E5's warm 14.9k: wait copy 1.1%).
 
+## 7d. E11–E13 (2026-10-04, late): the wall is the walk's over-issue
+
+**E13 — the streamed-bytes telemetry (commit d7e6a50).** One log line after
+each timing block ("streamed N experts, X GiB host->device"), counting both
+staging paths. On the c524 preset, the interleaved probe (§9's shape), per
+~2-4k-fresh turn:
+
+| turn | fresh tok | streamed experts | GiB H2D | wait copy |
+|------|-----------|------------------|---------|-----------|
+| A1 | 4,321 | 16,971 | 43.8 | 549 ms (31%) |
+| B1 | 2,205 | 16,706 | 43.0 | 791 ms (46%) |
+| A2 | 2,822 | 16,817 | 43.3 | 697 ms (40%) |
+| B2 | 2,196 | 16,706 | 43.0 | 802 ms (47%) |
+
+The cache holds 8,650 slots of 24,576 pairs, so ~17.9k experts are
+non-resident — **each turn streams essentially the ENTIRE non-resident set**,
+while the routing picks ~4.8k pairs (~6-8 GiB of true misses). At the probed
+26.3 GB/s, 43 GiB is ~1.65 s of DMA against a 1.75 s GPU timeline: the copy
+stream is saturated wall-to-wall and "wait copy" is the compute stream
+catching up to it. The walk's plan is built in expert-id order BEFORE the
+host routing is consulted (the code says so at the plan builder), so the
+issuer walks over - and DMAs - every non-resident expert up to each layer's
+highest routed id. **The over-issue, not the misses, is the deep-turn wall.**
+This subsumes §7c's cost tree: the D2D gathers (§8.1) and the misses were
+both riding under this stream.
+
+**E11 — forcing the small-chunk path (`STRATA_PREFILL_STREAM_MIN=999999`):
+REJECTED.** The idea was to land every chunk on `stage_one`, which stages
+`order` (routed experts). Measured: the first read collapsed to 61 s
+(47.8 s GPU timeline, 174k experts staged - a cold-cache pathology in that
+path), and the turns were at best ~5% better while STILL streaming 13-15k
+experts each. The path is not routed-filtered either; it just pays per-expert
+waits on top.
+
+**E12 — the idle 3090 as a remote expert tier (`CUDA_VISIBLE_DEVICES=g1,0` +
+`--expert-cache-device1 6000`): REJECTED for this preset.** The card worked
+(1.9-3.1k expert entries per request, packed returns 23-30 MiB vs 143-159
+full-row) but the primary waited 46-186 ms per request on it, wait copy ROSE
+to 46-53% (the tier's input staging competes with the miss stream on the same
+PCIe), the 5090's own cache shrank 8,650 -> 6,146 slots for the tier's
+contexts, and decode slowed (24 tok in 295-340 ms vs 197-250). Net ~-250 ms
+per turn. Answers §11's peer prediction: coverage does not pay while the
+stream itself is 5-7x over-issued - fix the over-issue first, then re-measure
+the tier against a right-sized stream.
+
 ## 8. Fix directions (ranked, fork-side, upstream-able)
 
 *(2026-10-04 postscript: 1 and 2 are BUILT (commits cee2509, 2566a60,
@@ -288,9 +333,22 @@ host-side routing isn't known at plan time. For real text that over-streams
 c524 preset, and the mechanism is now understood: the D2D gather was
 overlapped with the H2D miss stream (full-duplex PCIe), and the profile
 already covers repo-text conversations so the slice's thrash guard
-correctly skips. The wall is bounded by the miss stream itself — the
-remaining lever is pinning/source speed, exactly E9's +5-16%. Full
-numbers: bench/results/2026-10-04-expert-residency/README.md.)*
+correctly skips. Full numbers:
+bench/results/2026-10-04-expert-residency/README.md.)*
+
+**0. THE one that matters now — route the stream (E13's target).** Build the
+streamed walk's per-layer seq FROM THE CHUNK'S ROUTING (the host grouping's
+ids/cnt tables, already computed before the walk runs) instead of the
+id-ordered non-resident list. Measured size: 43 GiB -> ~6-8 GiB per turn,
+1.65 s of DMA -> ~0.3 s; the waits should collapse toward the necessary
+transfer and the turn wall plausibly drops 1.9 s -> ~1.1-1.2 s (compute's own
+~1.0-1.2 s becomes the floor). The code notes the plan is "built before host
+routing known" — that ordering is the bug's address. Verification is already
+standing: the streamed-GiB telemetry line (d7e6a50) plus the phase blocks,
+the parity gate, and §9's probe. After it lands, RE-RUN E12 (the 3090 tier
+against a right-sized stream) and re-check the anticipation slice's thrash
+guard - both were measured against the over-issuing walk and may flip
+positive once the stream is honest.
 
 1. **Pre-gathered resident slots (new top pick — mechanism-independent).**
    Store resident experts in MMQ group layout (gather ONCE at fill/admission
@@ -403,10 +461,17 @@ for name, seed in (("a", 0), ("b", 1000)):
   miss counter would make the E5 conclusion continuously watchable; add one
   in the telemetry port (§10.3).
 - Real-text steady-state rate (the filler-bias caveat, §6).
-- Is the copy serialized per-expert with a sync each, or batched? (Read the
-  gather/copy path in prefill.cpp before designing fix §8.1.)
-- Prediction to check when convenient: the 2×3090 peer preset (13,056 slots
-  vs 8,651) should show proportionally cheaper cold tails.
+- ~~Is the copy serialized per-expert with a sync each, or batched?~~
+  (Answered by E5/E13: the D2D gathers are kernels on the compute stream,
+  the H2D misses are async DMAs on the copy stream — genuinely parallel,
+  full duplex.)
+- ~~The 2×3090 peer preset should show proportionally cheaper cold tails.~~
+  (Answered by E12: measured NEGATIVE on c524 — see §7d; revisit only after
+  fix §8.0.)
+- The `stage_one` cold-cache pathology (E11's 61 s first read): why does the
+  small-chunk path stage 174k experts for a 932-token read? Worth one look
+  if that path ever matters again — it also streamed 13-15k experts/turn
+  where its `order` implies ~4.8k.
 
 ## 12. Maintenance-interval work log (2026-10-04, evening)
 
@@ -466,3 +531,12 @@ for name, seed in (("a", 0), ("b", 1000)):
   (byte-exact, PASS); the slice-on run is the smoke: swap fired
   ("388 pairs into 512 slots, 124 already resident, 95.0 ms, hidden in
   the park/restore"), outputs correct.
+- **E13's telemetry + the two negative experiments (late evening)**: the
+  streamed-experts/GiB line landed (d7e6a50; the threaded issuer's byte
+  count was missing — its counters fold at chunk end, so the first cut froze
+  once a run left the small-chunk path). The finding: ~16.8k experts / ~43
+  GiB streamed per turn vs ~4.8k routed pairs — the walk re-streams the
+  whole non-resident set every turn. E11 (STREAM_MIN=999999) and E12
+  (3090 remote tier, --expert-cache-device1 6000) both measured negative
+  and were reverted; the preset is back on defaults and serving. §7d has
+  the numbers, §8.0 is the fix they point at.
