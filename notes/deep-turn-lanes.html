@@ -1,0 +1,242 @@
+<title>The two-second turn</title>
+<style>
+/* layout: one measured column; scaled swimlane rows built from ms by script */
+:root {
+  --bg: #FBFBF8; --fg: #1A1D23; --muted: #5B6370; --line: #D9DAD2; --card: #F1F1EC;
+  --attn: #6B7280; --wait: #B45309; --d2d: #0F766E; --gemm: #4338CA; --setup: #9CA3AF;
+  --combine: #78716C; --restore: #15803D; --h2d: #0E7490; --ink-bar: #23272F;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14161A; --fg: #E8E9E4; --muted: #9AA1AB; --line: #33373E; --card: #1D2025;
+    --attn: #8B93A1; --wait: #D97706; --d2d: #2DD4BF; --gemm: #A5B4FC; --setup: #6B7280;
+    --combine: #A8A29E; --restore: #4ADE80; --h2d: #67E8F9; --ink-bar: #C9CCD4;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14161A; --fg: #E8E9E4; --muted: #9AA1AB; --line: #33373E; --card: #1D2025;
+  --attn: #8B93A1; --wait: #D97706; --d2d: #2DD4BF; --gemm: #A5B4FC; --setup: #6B7280;
+  --combine: #A8A29E; --restore: #4ADE80; --h2d: #67E8F9; --ink-bar: #C9CCD4;
+  color-scheme: dark;
+}
+html { color-scheme: light; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 400 15px/1.55 "IBM Plex Sans", system-ui, sans-serif; }
+.mono { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+.wrap { max-width: 920px; margin: 0 auto; padding: 40px 20px 56px; }
+h1 { font-size: clamp(26px, 5vw, 38px); line-height: 1.12; letter-spacing: -0.01em;
+  margin: 0 0 10px; text-wrap: balance; font-weight: 640; }
+.sub { color: var(--muted); font-size: 14px; margin: 0 0 6px; max-width: 62ch; }
+.kicker { font: 600 11px/1 "IBM Plex Mono", monospace; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--h2d); margin: 34px 0 8px; }
+h2 { font-size: 18px; margin: 0 0 4px; font-weight: 620; }
+.lede { color: var(--muted); font-size: 13.5px; margin: 0 0 14px; max-width: 66ch; }
+
+/* the phase bar */
+.bar { display: flex; height: 46px; border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--line); }
+.bar > div { position: relative; min-width: 2px; }
+.bar .lab { position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; font: 600 11px/1.1 "IBM Plex Mono", monospace;
+  color: #FFFFFF; text-align: center; overflow: hidden; }
+.axis { display: flex; justify-content: space-between; color: var(--muted);
+  font: 400 10.5px/1 "IBM Plex Mono", monospace; margin-top: 5px; }
+.legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 6px 18px; margin-top: 14px; }
+.legend .li { display: flex; gap: 9px; align-items: baseline; font-size: 12.5px; }
+.sw { width: 11px; height: 11px; border-radius: 3px; flex: none; position: relative; top: 1px; }
+.legend b { font-weight: 600; }
+.legend .ms { color: var(--muted); }
+
+/* lanes */
+.scroll { overflow-x: auto; margin: 0 -20px; padding: 0 20px; }
+.lanes { min-width: 760px; }
+.lane { display: grid; grid-template-columns: 168px 1fr; gap: 12px; align-items: center;
+  margin: 7px 0; }
+.lane .who { text-align: right; font-size: 12px; line-height: 1.3; color: var(--fg); }
+.who b { display: block; font-weight: 620; font-size: 12.5px; }
+.who span { color: var(--muted); font-size: 11px; }
+.track { position: relative; height: 30px; background: var(--card);
+  border-radius: 5px; border: 1px solid var(--line); }
+.blk { position: absolute; top: 3px; bottom: 3px; border-radius: 3px; min-width: 2px;
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+  font: 600 9.5px/1 "IBM Plex Mono", monospace; color: #fff; white-space: nowrap; }
+.blk.out { color: var(--fg); background: none !important; border: 1.5px dashed currentColor; }
+.ticks { position: relative; height: 16px; margin-left: 180px; }
+.ticks span { position: absolute; top: 0; color: var(--muted);
+  font: 400 10px/1 "IBM Plex Mono", monospace; transform: translateX(-50%); }
+.duo { position: relative; margin: 2px 0 2px 180px; height: 34px; }
+.duo svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.duo .cap { position: absolute; font: 500 10.5px/1.25 "IBM Plex Mono", monospace;
+  color: var(--muted); }
+
+.callout { border-left: 3px solid var(--wait); background: var(--card);
+  border-radius: 0 8px 8px 0; padding: 14px 18px; margin-top: 26px; max-width: 72ch; }
+.callout b { font-weight: 640; }
+.callout p { margin: 6px 0 0; font-size: 14px; }
+.foot { margin-top: 30px; padding-top: 12px; border-top: 1px solid var(--line);
+  color: var(--muted); font-size: 11.5px; max-width: 78ch; }
+a { color: var(--h2d); }
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;640&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<div class="wrap">
+
+<h1>The two-second turn</h1>
+<p class="sub">One deep-context request on the strata engine: <span class="mono">5,213</span> tokens of
+prefix restored, <span class="mono">2,822</span> fresh tokens read, wall
+<span class="mono">1.96&nbsp;s</span>. Four processes run through it at once — this is what the
+engine log's phase totals actually describe.</p>
+
+<p class="kicker">Phase totals · compute stream</p>
+<h2>Where the 1.75&nbsp;s of GPU timeline goes</h2>
+<p class="lede">Totals across the turn's 48 layers (the layers interleave these phases; the log sums
+them). Measured on an RTX&nbsp;5090, c524 preset, 8,650-slot expert cache.</p>
+
+<div class="scroll"><div class="lanes">
+  <div class="bar" id="bar"></div>
+  <div class="axis"><span>0 ms</span><span>440</span><span>880</span><span>1,320</span><span>1,783 ms</span></div>
+</div></div>
+<div class="legend" id="legend"></div>
+
+<p class="kicker">Turn start · the restore window</p>
+<h2>Park, restore, and the anticipation slice — all at once</h2>
+<p class="lede">Magnified ×4 out of the turn above. Parking the outgoing conversation (VRAM&nbsp;→&nbsp;RAM)
+and restoring the incoming one (RAM&nbsp;→&nbsp;VRAM) move opposite directions over PCIe at the same
+time; the opt-in anticipation slice fills its experts on a third stream inside the same gap.</p>
+
+<div class="scroll"><div class="lanes" id="restore"></div></div>
+
+<p class="kicker">Steady state · reading the fresh tokens</p>
+<h2>Four lanes, one PCIe</h2>
+<p class="lede">Schematic — proportions are the measured totals ÷ 48 layers, three layers shown. The
+compute stream gathers <em>resident</em> experts (device&nbsp;→&nbsp;device) while the copy stream
+brings the <em>missed</em> ones up from RAM (host&nbsp;→&nbsp;device): full duplex, so the gathers
+hide under the waits.</p>
+
+<div class="scroll"><div class="lanes" id="steady"></div></div>
+
+<div class="callout">
+  <b>Why deleting the gathers changed nothing.</b>
+  <p>Turning the resident experts' D2D gathers off entirely
+  (<span class="mono">STRATA_PF_RESIDENT_DIRECT=1</span>, bit-exact output) moved the phases —
+  wait&nbsp;copy 548&nbsp;→&nbsp;384&nbsp;ms, dequant 370&nbsp;→&nbsp;520&nbsp;ms — and left the wall at
+  1.98&nbsp;s. The gathers were riding under the miss stream all along. The turn is bounded by how fast
+  the missed experts come up from RAM, which is what the anticipation slice attacks — where the
+  shipped profile doesn't already cover the conversation.</p>
+</div>
+
+<p class="foot">Measured 2026-10-04: engine 0.1.38-fork, RTX&nbsp;5090, NVFP4 pack, 8,650-slot expert
+cache (6,602 from the shipped profile); A-turn2 of the interleaved two-conversation probe
+(<span class="mono">notes/ab_interleave_probe.py</span>). Park/restore windows from the E-probe
+engine-log captures; slice fill 95&nbsp;ms for 388 experts measured on the RTX&nbsp;3090 parity gate.
+Full tables: <span class="mono">bench/results/2026-10-04-expert-residency/README.md</span>.</p>
+</div>
+
+<script>
+const C = { attn:"var(--attn)", wait:"var(--wait)", d2d:"var(--d2d)", gemm:"var(--gemm)",
+            setup:"var(--setup)", combine:"var(--combine)", restore:"var(--restore)", h2d:"var(--h2d)" };
+
+/* ---- section 1: the phase bar (1,783 ms) ---- */
+const phases = [
+  { n:"setup",              ms:31,  c:C.setup,   lab:null },
+  { n:"attention + recurrence", ms:472, c:C.attn, lab:"attention 472" },
+  { n:"wait copy",          ms:548, c:C.wait,    lab:"wait copy 548" },
+  { n:"dequant — D2D gathers", ms:370, c:C.d2d,  lab:"gathers 370" },
+  { n:"gemm gate/up + down", ms:311, c:C.gemm,   lab:"gemm 311" },
+  { n:"combine",            ms:51,  c:C.combine, lab:null },
+];
+const TOT = phases.reduce((s,p)=>s+p.ms,0);
+const bar = document.getElementById("bar");
+phases.forEach(p=>{
+  const d = document.createElement("div");
+  d.style.width = (100*p.ms/TOT).toFixed(3)+"%";
+  d.style.background = p.c;
+  if (p.lab) { const l=document.createElement("span"); l.className="lab";
+    l.textContent = p.lab; d.appendChild(l); }
+  bar.appendChild(d);
+});
+const legend = document.getElementById("legend");
+const notes = {
+  setup:"embed, routing tables, PLE — 31 ms (1.7%)",
+  attn:"hc read · gdn · qsa · router, ×48 layers — 472 ms (26.5%)",
+  wait:"compute stream stalled on the copy stream's missed experts — 548 ms (30.7%)",
+  d2d:"every routed expert copied into the group buffer — 370 ms (20.8%)",
+  gemm:"MMQ int8 tensor cores — 311 ms (17.4%)",
+  combine:"weighted expert sum — 51 ms (2.9%)" };
+phases.forEach(p=>{
+  const li=document.createElement("div"); li.className="li";
+  li.innerHTML = `<span class="sw" style="background:${p.c}"></span><span><b>${p.n}</b> <span class="ms mono">${notes[p.n]}</span></span>`;
+  legend.appendChild(li);
+});
+
+/* ---- lane helpers ---- */
+function lane(parent, who, sub) {
+  const row=document.createElement("div"); row.className="lane";
+  const w=document.createElement("div"); w.className="who";
+  w.innerHTML=`<b>${who}</b><span>${sub}</span>`;
+  const t=document.createElement("div"); t.className="track";
+  row.append(w,t); parent.appendChild(row); return t;
+}
+function blk(track, t0, t1, span, color, txt, out) {
+  const b=document.createElement("div"); b.className="blk"+(out?" out":"");
+  b.style.left=(100*t0/span)+"%"; b.style.width=(100*(t1-t0)/span)+"%";
+  b.style.background=color; if(out) b.style.color=color;
+  if(txt) b.textContent=txt; track.appendChild(b); return b;
+}
+function ticks(parent, span, marks, off) {
+  const t=document.createElement("div"); t.className="ticks";
+  if(off) t.style.marginLeft=off+"px";
+  marks.forEach(m=>{ const s=document.createElement("span");
+    s.style.left=(100*m/span)+"%"; s.textContent=m; t.appendChild(s); });
+  parent.appendChild(t);
+}
+
+/* ---- section 2: the restore window (190 ms, ×4) ---- */
+const R = document.getElementById("restore");
+const RS = 190;
+const tPark  = lane(R,"park outgoing","VRAM → RAM · D2H · ~85 ms");
+const tRest  = lane(R,"restore incoming","RAM → VRAM · H2D · ~150 ms");
+const tAnti  = lane(R,"anticipation slice","opt-in · 3rd stream · 95 ms");
+blk(tPark, 0, 85, RS, C.d2d, "D2H 85");
+blk(tRest, 40, 190, RS, C.restore, "H2D 150");
+blk(tAnti, 70, 165, RS, C.h2d, "388 experts · 95 ms");
+ticks(R, RS, [0,50,100,150,190]);
+
+/* ---- section 3: steady state (3 layers ≈ 110 ms) ---- */
+const S = document.getElementById("steady");
+const SS = 3*36.6;
+const tCpu  = lane(S,"CPU stager threads","unpinned blobs → pinned ring · 93 ms/turn");
+const tCopy = lane(S,"copy stream","missed experts H2D · pinned RAM → ring slots");
+const tComp = lane(S,"compute stream","the phase bar's home · 48 layers");
+for (let i=0;i<3;i++) {
+  const z=i*36.6;
+  blk(tComp, z+0.5,  z+10.3, SS, C.attn,  "attn 9.8");
+  blk(tComp, z+10.3, z+18.0, SS, C.d2d,   "gather 7.7");
+  blk(tComp, z+18.0, z+29.4, SS, C.wait,  "wait 11.4");
+  blk(tComp, z+29.4, z+35.9, SS, C.gemm,  "gemm 6.5");
+  blk(tComp, z+35.9, z+36.4, SS, C.combine);
+  blk(tCopy, z+6,    z+34,    SS, C.h2d,  null, true);
+}
+blk(tCpu, 2, 14, SS, C.attn, "stage", true);
+blk(tCpu, 30, 40, SS, C.attn, "stage", true);
+blk(tCpu, 46, 52, SS, C.attn, "PLE", true);
+blk(tCpu, 70, 84, SS, C.attn, "stage", true);
+ticks(S, SS, [0,36.6,73.2,109.8].map(v=>Math.round(v)));
+
+/* full-duplex arrows between the copy and compute lanes */
+const duo=document.createElement("div"); duo.className="duo";
+duo.innerHTML = `<svg viewBox="0 0 100 34" preserveAspectRatio="none">
+  <defs><marker id="ah" viewBox="0 0 6 6" refX="5" refY="3" markerWidth="5" markerHeight="5" orient="auto">
+    <path d="M0 0 L6 3 L0 6 z" fill="var(--h2d)"/></marker>
+  <marker id="ad" viewBox="0 0 6 6" refX="5" refY="3" markerWidth="5" markerHeight="5" orient="auto">
+    <path d="M0 0 L6 3 L0 6 z" fill="var(--d2d)"/></marker></defs>
+  <line x1="30" y1="4" x2="30" y2="30" stroke="var(--h2d)" stroke-width="1.4" marker-end="url(#ah)"/>
+  <line x1="63" y1="30" x2="63" y2="4" stroke="var(--d2d)" stroke-width="1.4" marker-end="url(#ad)"/>
+</svg>
+<span class="cap" style="left:33%;top:0">H2D up: misses</span>
+<span class="cap" style="left:59%;top:22px">D2D down: gathers</span>
+<span class="cap" style="left:72%;top:11px">same wire, both ways</span>`;
+S.parentNode.insertBefore(duo, tComp.parentNode.nextSibling);
+</script>
