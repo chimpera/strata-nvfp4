@@ -326,6 +326,30 @@ per turn. Answers §11's peer prediction: coverage does not pay while the
 stream itself is 5-7x over-issued - fix the over-issue first, then re-measure
 the tier against a right-sized stream.
 
+**E14 — fix §8.0 BUILT AND MEASURED (STRATA_PF_ROUTED_STREAM=1, same night).**
+Each layer's stream segment is filtered to the experts its routing actually
+picks, at the moment the layer's host grouping makes the routing known
+(single-threaded issuing while on - the filter rewrites the seq in place).
+Same probe, read walls: 1,983/1,924/1,956/1,922 ms -> 1,708/1,511/1,609/
+1,545 ms (-14 to -21%); wait copy 548-804 -> 405-472 ms; streamed 43.0 ->
+33.3-34.2 GiB/turn; parity gate PASS byte-exact default-off. Left ON in the
+c524 preset.
+
+**The corrected physics.** E13's "~4.8k routed pairs" undercounted for
+multi-k-token turns: T x K routing instances over 512 experts per layer means
+a 2-4k-token chunk routes NEARLY EVERY expert, so the filter's headroom is
+the ~20% of non-resident experts the chunk happens not to touch - the rest
+must cross PCIe once per turn regardless. The deep-turn wall is now cleanly
+`(non-resident experts touched) x 2.7 MB / 26.3 GB/s ~= 1.3 s of DMA`,
+overlapped against ~1.0 s of compute. The levers that remain, in order:
+cache coverage (more slots), link bandwidth (the 5090 idles at Gen1 and
+probes 26.3 GB/s - Gen4 x16), or shrinking the touched set per chunk.
+
+**E15 — the 3090 tier ON TOP of the routed stream: still REJECTED.**
+2,159/2,061/2,086/1,996 ms - worse than E14 alone. Even against a
+right-sized stream, the tier's per-layer sync waits and input staging cost
+more than the 6,000 experts x 2.7 MB it removes from the miss stream.
+
 ## 8. Fix directions (ranked, fork-side, upstream-able)
 
 *(2026-10-04 postscript: 1 and 2 are BUILT (commits cee2509, 2566a60,
@@ -336,7 +360,8 @@ already covers repo-text conversations so the slice's thrash guard
 correctly skips. Full numbers:
 bench/results/2026-10-04-expert-residency/README.md.)*
 
-**0. THE one that matters now — route the stream (E13's target).** Build the
+**0. Route the stream - BUILT, MEASURED, ON in production (E14 above;
+STRATA_PF_ROUTED_STREAM, commit follows).)** Build the
 streamed walk's per-layer seq FROM THE CHUNK'S ROUTING (the host grouping's
 ids/cnt tables, already computed before the walk runs) instead of the
 id-ordered non-resident list. Measured size: 43 GiB -> ~6-8 GiB per turn,
@@ -540,3 +565,11 @@ for name, seed in (("a", 0), ("b", 1000)):
   (3090 remote tier, --expert-cache-device1 6000) both measured negative
   and were reverted; the preset is back on defaults and serving. §7d has
   the numbers, §8.0 is the fix they point at.
+- **Fix §8.0 landed same night (E14)**: STRATA_PF_ROUTED_STREAM (default
+  off in code, ON in the c524 preset) - each layer's stream segment is
+  filtered to its routing's picks at host-grouping time. Read walls
+  -14 to -21% (1.98/1.92/1.96/1.92 s -> 1.71/1.51/1.61/1.55 s), wait copy
+  548-804 -> 405-472 ms, streamed 43 -> ~34 GiB/turn. E15 (the 3090 tier
+  stacked on it) still lost; the tier stays rejected on this box. The
+  corrected physics - big chunks route nearly every expert, so the wall is
+  now the honest miss-stream floor - is recorded in §7e.
