@@ -466,6 +466,10 @@ struct Prefill::Impl {
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
+    // the working-set feature: routed-id counts per (layer, expert), accumulated across run() calls and
+    // handed to the serve loop by drain_routing (turn N-1's routing covers ~87% of turn N's pairs - the
+    // slow-tail investigation's E7)
+    std::vector<int32_t> routing;
     // The grouping tables in mapped pinned memory, [ids | slot | src] of T_max * K each, then the MMQ bounds: kernels
     // read and write them in place.  A cudaMemcpyAsync of them queues behind the expert blobs the copy stream already
     // holds (up to `ring` of them, ~70 us each), and the GPU idles meanwhile - measured 4.2 s of a 128K prompt's
@@ -725,6 +729,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
+    // a re-init with a smaller chunk must not drop the counts a longer conversation already accumulated
+    if (m.routing.size() != (size_t) m.g->n_layers * m.g->n_expert)
+        m.routing.assign((size_t) m.g->n_layers * m.g->n_expert, 0);
     {
         const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
         const char* gc = std::getenv("STRATA_GROUP_COPY");
@@ -900,6 +907,14 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+
+void Prefill::drain_routing(std::vector<int32_t>& into) {
+    Impl& m = *impl_;
+    if (m.routing.empty()) return;
+    if (into.size() < m.routing.size()) into.resize(m.routing.size(), 0);
+    for (size_t i = 0; i < m.routing.size(); ++i) into[i] += m.routing[i];
+    std::fill(m.routing.begin(), m.routing.end(), 0);
+}
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {
@@ -2081,6 +2096,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
                         }
+                        // the conversation's routing history: the same counts, kept per (layer, expert) and
+                        // drained per request by drain_routing.  The fused path never reaches here (its routing
+                        // stays on the GPU) - the working-set feature's documented blind spot.
+                        for (int32_t e = 0; e < m.g->n_expert; ++e)
+                            if (m.cnt[(size_t) e] > 0) m.routing[(size_t) l * m.g->n_expert + e] += m.cnt[(size_t) e];
                         // multi-GPU: the rows of the experts the peer computes go last, as one block [rows_local, T*K)
                         const bool pre_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                         std::vector<char> on_peer;

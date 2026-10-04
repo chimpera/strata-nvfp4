@@ -4918,6 +4918,11 @@ int main(int argc, char** argv) {
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        // the working-set feature: THIS conversation's prompt routing counts, per (layer, expert) - drained from
+        // the prefill paths after each request's reads, seeded from a restored image's set, ranked into the
+        // parked image by park_current.  Turn N-1's routing covers ~87% of turn N's (layer, expert) pairs and
+        // the conversation's union ~94% (measured: post-restore-slow-tail.md E7, realistic text).
+        std::vector<int32_t> conv_heat;
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
@@ -6043,6 +6048,20 @@ int main(int argc, char** argv) {
                 return 1;
             }
             tr("prompt done (slots refilled)");
+            // the working-set feature: pull this request's prompt routing into the conversation's heat and, for
+            // the first time, into the adaptive tier's counts (the batched read path never fed usage - only the
+            // verify-window pool did).  Short window reads still count only into usage, not conv_heat.
+            {
+                std::vector<int32_t> req_routing;
+                sp.drain_routing(req_routing);
+                for (const auto& stg : stages) stg->sp.drain_routing(req_routing);
+                if (!req_routing.empty()) {
+                    if (conv_heat.size() < req_routing.size()) conv_heat.resize(req_routing.size(), 0);
+                    for (size_t i = 0; i < req_routing.size(); ++i) conv_heat[i] += req_routing[i];
+                    if (drive.d.usage.size() == req_routing.size())
+                        for (size_t i = 0; i < req_routing.size(); ++i) drive.d.usage[i] += (float) req_routing[i];
+                }
+            }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);

@@ -90,6 +90,14 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
+    /// The working-set feature: add this path's accumulated PROMPT routing counts (per (layer, expert),
+    /// n_layers x n_expert, one increment per routed id of every chunk, counted in the host-grouping pass)
+    /// into `into` and clear them - a drain, so a serve loop can poll after each request while `stats_`
+    /// keeps its accumulate-forever semantics.  Empty until `init`; a layer-split stage contributes only
+    /// its own layer range.  The fused expert path (STRATA_PF_FUSED) never counts: its routing stays on
+    /// the GPU.
+    void drain_routing(std::vector<int32_t>& into);
+
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
