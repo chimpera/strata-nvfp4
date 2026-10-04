@@ -1857,6 +1857,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const char* v = std::getenv("STRATA_PREFILL_ISSUER");
             return v == nullptr || std::atoi(v) != 0;
         }();
+        // post-restore-slow-tail.md §8.0: filter each layer's stream segment to the experts the routing actually
+        // picks, at the moment the layer's host grouping makes the routing known.  The unfiltered walk re-DMAs the
+        // whole non-resident set every turn (E13: ~16.8k experts, ~43 GiB, against ~4.8k routed pairs); the filter
+        // cuts the stream to the misses.  Issuing is single-threaded while on: the filter rewrites seq in place,
+        // so the issuer thread must not be reading it.
+        static const bool routed_stream = [] {
+            const char* v = std::getenv("STRATA_PF_ROUTED_STREAM");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
         std::atomic<size_t> a_issued{0}, a_consumed{0};
         std::atomic<bool> a_stop{false};
         double iss_ms = 0;
@@ -1867,7 +1876,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::thread* t;
             ~IssuerJoin() { if (t->joinable()) { stop->store(true); t->join(); } }
         } issuer_join{&a_stop, &issuer};
-        const bool threaded_issue = stream_all && issuer_on;
+        const bool threaded_issue = stream_all && issuer_on && !routed_stream;
         if (threaded_issue) {
             issuer = std::thread([&] {
                 const core::OnDevice od(m.device);
@@ -1896,7 +1905,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     a_issued.store(idx + 1, std::memory_order_release);
                 }
             });
-        } else if (stream_all) {
+        } else if (stream_all && !routed_stream) {
             issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
         }
         // the consumer's side: entry k's copy is on the copy stream (the thread issued it), then k is given back
@@ -2464,6 +2473,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
                         for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
                             if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
+                        if (routed_stream && stream_all && !order.empty()) {
+                            // §8.0: this layer's segment becomes its routed misses only.  The entries keep their
+                            // stager jobs (an unpicked expert's job is never waited for; the stager stalls a ring
+                            // behind the DMAs, so the host-side waste is bounded); the not-yet-filtered tail of
+                            // later layers moves down with the segment, and their starts follow it.
+                            const size_t s0 = seq_start[(size_t) l], s1 = seq_start[(size_t) l + 1];
+                            size_t w = s0;
+                            for (size_t k2 = s0; k2 < s1; ++k2)
+                                if (m.cnt[(size_t) seq[k2].e] > 0) seq[w++] = seq[k2];
+                            if (w < s1) {
+                                const size_t dropped = s1 - w;
+                                std::move(seq.begin() + (int64_t) s1, seq.end(), seq.begin() + (int64_t) w);
+                                seq.resize(seq.size() - dropped);
+                                for (int64_t l2 = l + 1; l2 <= g.n_layers; ++l2) seq_start[(size_t) l2] -= dropped;
+                            }
+                            issue_until(w);   // the layer's misses now: they land behind this layer's Xq quantize
+                        }
                         n_order = order.size();
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
