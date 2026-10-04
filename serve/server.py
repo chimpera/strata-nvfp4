@@ -2396,6 +2396,11 @@ def make_handler(svc: Service):
                     with svc.status_lock:
                         busy = bool(svc.status.get("busy"))
                     slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
+                    # the (read, total) the engine reports while a prompt is read (PP lines) —
+                    # gateways that poll /slots (llama.cpp's names) surface it as read progress
+                    progress = getattr(svc.engine, "progress", None)
+                    if progress:
+                        slot["n_prompt_tokens_processed"], slot["n_prompt_tokens"] = progress
                     self._json(200, [slot] if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
