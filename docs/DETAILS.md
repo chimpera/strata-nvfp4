@@ -167,6 +167,15 @@ GPU nor the RAM budget holds (only pages - the experts computed are the same; `S
 is what runs [Unsloth's UD-Q4_K_XL](UNSLOTH_Q4.md) (72 GiB of experts) on a 64 GB PC: 7-8.5 tokens/s at N = 40 on an
 RTX 5070, against ~3 tokens/s before these changes.
 
+**Prompt chunk planning (upstream #693):** `--prefill auto` tries every 1,024 tokens above 8,192 up to the
+`auto:` limit (not just 16,384 then 8,192), so the largest chunk the expert cache can lend is found; and a prompt
+segment reads in equal chunks of `ceil(tokens / n)` instead of full chunks plus a short tail - unless that tail is
+below the stream-everything threshold (1,024 tokens; `STRATA_PREFILL_STREAM_MIN`), where a small last chunk moves
+only the experts its own tokens route to. The physics is the deep-turn investigation's: a chunk at or above the
+threshold streams nearly every expert the GPU does not hold, whatever its length, so a long prompt's cost is its
+number of such chunks. Upstream measured on an RTX 5070 Ti 16 GB (IQ3_XXS): 32K / 64K / 100K prompts read 21-38%
+faster through a 13,312 chunk that the old list skipped over. The fork keeps its `alloc_top()` lend caps.
+
 **Read-ahead at start (Linux, upstream #699):** the weights, the native dense matrices, the GPU cache's fill from
 the profile, the resident RAM copy and the MTP draft files are asked for ahead of their reads (madvise /
 posix_fadvise WILLNEED in 128 KiB steps), so the drive sees a deep queue instead of one page fault at a time.
