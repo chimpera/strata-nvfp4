@@ -1464,6 +1464,21 @@ int main(int argc, char** argv) {
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
+    // ---- the working-set feature's anticipation slice: resolve the size once (--expert-anticipation,
+    // STRATA_PF_ANTICIPATE overrides), and decline it under every multi-GPU shape - each GPU's cache is its
+    // own, so CUDA0's slice could not track a conversation whose layers span stages, and the peer/remote
+    // tiers hold their own experts.  Single-GPU serves only.
+    int64_t anticipation_slots = [&o] {
+        const char* v = std::getenv("STRATA_PF_ANTICIPATE");
+        return v != nullptr ? std::atoll(v) : o.expert_anticipation;
+    }();
+    if (anticipation_slots > 0 &&
+        (multi_gpu || o.peer_device >= 1 || o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
+         o.expert_cache_remote[2] > 0)) {
+        std::fprintf(stderr, "strata generate: --expert-anticipation needs a single GPU's expert cache (no layer "
+                             "split, peer device or remote tiers); the anticipation slice is off\n");
+        anticipation_slots = 0;
+    }
     // ---- the fork's low-RAM mode.  The resident arena needs every expert in RAM (63 GiB for the NVFP4 pack); below
     // 96 GB installed that cannot fit beside Windows, so the experts the GPU cache does not hold go to a RAM budget
     // (0.1.31's tier: hottest first, page-locked) and the rest are read from the files when needed - unbuffered,
@@ -3077,13 +3092,19 @@ int main(int argc, char** argv) {
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
-        const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+        // the anticipation slice claims its slots of the largest blob from the same room, so any layer's
+        // expert fits any slice slot (the fit check the K/V's heat-move makes)
+        const uint64_t slice_room =
+            anticipation_slots > 0 ? (uint64_t) anticipation_slots * ((lay.max_blob + 255) / 256 * 256) : 0;
+        const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room) > slice_room
+                                 ? std::min<uint64_t>(budget, (uint64_t) free_room) - slice_room : 0;
         for (const auto& pr : profile) {
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > cap) break;
             used += b;
             sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
         }
+        for (int64_t i = 0; i < anticipation_slots; ++i) sized_slots.push_back((int64_t) lay.max_blob);
         o.expert_cache = (int) sized_slots.size();
     }
     if (o.expert_cache > 0) {
@@ -3177,7 +3198,27 @@ int main(int argc, char** argv) {
                                  "page file lets it use more of the free VRAM\n",
                          o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
     }
+    cudaStream_t antic_stream = nullptr;   // the anticipation slice's fill stream (working-set feature)
+    if (anticipation_slots > 0 && cudaStreamCreateWithFlags(&antic_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        std::fprintf(stderr, "strata generate: --expert-anticipation: no stream for the slice fills; off\n");
+        antic_stream = nullptr;
+        anticipation_slots = 0;
+    }
     if (o.expert_cache > 0) {
+        // the working-set feature: claim the reserved slice now that the final size is known.  A shrink may
+        // have dropped the appended slice slots (or the uniform count come out below N) - then the feature is
+        // simply off for this run, never a startup failure.
+        if (anticipation_slots > 0) {
+            if (xcache.slots() > anticipation_slots) {
+                xcache.set_reserved(anticipation_slots);
+                std::fprintf(stderr, "strata generate: expert anticipation: %lld of %lld slots reserved at the "
+                                     "arena's top\n", (long long) anticipation_slots, (long long) xcache.slots());
+            } else {
+                std::fprintf(stderr, "strata generate: --expert-anticipation: the expert cache came out at %lld "
+                                     "slots; the anticipation slice is off this run\n", (long long) xcache.slots());
+                anticipation_slots = 0;
+            }
+        }
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
@@ -3227,7 +3268,7 @@ int main(int argc, char** argv) {
         // its range is full (one full layer used to end the whole fill, leaving most layers empty)
         const bool per_layer = xcache.per_layer_admission();
         const int64_t want = per_layer ? (int64_t) profile.size()
-                                       : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+                                       : std::min<int64_t>((int64_t) profile.size(), xcache.alloc_top());
         // #286: an unbuffered file tier reads the pairs in batches of 64, the next batch while this one is copied
         std::future<void> ahead;
         auto read_batch = [&](int64_t at) { src.prefetch_pairs(profile.data() + at, std::min<int64_t>(64, want - at)); };
@@ -3262,7 +3303,7 @@ int main(int argc, char** argv) {
         }
         mem_mark("the profile fill");
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
-                     (long long) prefilled, (long long) (per_layer ? xcache.slots() : want));
+                     (long long) prefilled, (long long) (per_layer ? xcache.alloc_top() : want));
     }
 
     for (auto& stp : stages) {
@@ -4128,8 +4169,10 @@ int main(int argc, char** argv) {
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
             k = 0;
-            while (k < xcache.slots() &&
-                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+            // the loan never reaches into the anticipation slice at the arena's top
+            const int64_t top = xcache.alloc_top();
+            while (k < top &&
+                   (uint64_t) ((int64_t) xcache.slot_offsets()[(size_t) top] - (int64_t) xcache.slot_offsets()[(size_t) (top - k)]) < need) ++k;
         }
         return k;
     };
@@ -4167,13 +4210,13 @@ int main(int argc, char** argv) {
                 // above 8192: only when asked for, and only when a prompt of the context can use it
                 if (c > 8192 && (c > o.prefill_auto_max || c > o.max_context)) continue;
                 const int64_t k = slots_for(c);
-                if (k + 128 <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots()) { chunk = c; return k; }
+                if (k + 128 <= xcache.alloc_top() && k * 100 <= kAutoLendPct * xcache.alloc_top()) { chunk = c; return k; }
             }
             return 0;
         }
         for (int64_t c = chunk; c >= 256; c /= 2) {
             const int64_t k = slots_for(c);
-            if (k + 128 <= xcache.slots()) { chunk = c; return k; }
+            if (k + 128 <= xcache.alloc_top()) { chunk = c; return k; }
         }
         return 0;
     };
@@ -4263,7 +4306,8 @@ int main(int argc, char** argv) {
                 for (size_t r = 0; r < profile.size(); ++r)
                     rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= kvg.top) cold.emplace_back(heat((int32_t) i), (int32_t) i);
+                    if (host_res[i] >= kvg.top && host_res[i] < xcache.alloc_top())   // never the anticipation slice
+                        cold.emplace_back(heat((int32_t) i), (int32_t) i);
                 std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             }
             --kvg.lo;
@@ -4406,7 +4450,7 @@ int main(int argc, char** argv) {
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
             int64_t chunk = o.prefill_chunk;
             const int64_t k = plan_lend(chunk);
-            if (k > 0) lend_from = xcache.slots() - k;
+            if (k > 0) lend_from = xcache.alloc_top() - k;
         }
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
                                                     o.resident_budget, &profile);
@@ -4491,9 +4535,12 @@ int main(int argc, char** argv) {
             const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr);
             strata::core::ExpertCache& xc = *p.cache;
             if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
+                // the loan ends at alloc_top(), never inside the anticipation slice (a stage cache has no
+                // reservation and alloc_top() == slots() there, so this is today's arithmetic for it)
+                const int64_t top = xc.alloc_top();
                 int64_t k = 0;
-                while (k < xc.slots() &&
-                       (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
+                while (k < top &&
+                       (uint64_t) ((int64_t) xc.slot_offsets()[(size_t) top] - (int64_t) xc.slot_offsets()[(size_t) (top - k)]) < need) ++k;
                 return k;
             }
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
@@ -4501,8 +4548,8 @@ int main(int argc, char** argv) {
         };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
             strata::core::ExpertCache& xc = *p.cache;
-            return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
-                                     : (uint64_t) (xc.slots() - first) *
+            return xc.slot_offsets() ? (uint64_t) ((int64_t) xc.slot_offsets()[(size_t) xc.alloc_top()] - (int64_t) xc.slot_offsets()[(size_t) first])
+                                     : (uint64_t) (xc.alloc_top() - first) *
                                            (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
         };
         // #340: a layer split whose caches already hold most experts streams few of them through the prompt path, so
@@ -4535,8 +4582,8 @@ int main(int argc, char** argv) {
             // (no split) this reduces to plan_lend exactly, so the single-GPU loan is unchanged from main.
             auto fits_one = [&](const PfPart& p, int64_t c, bool cap) -> bool {
                 const int64_t k = part_slots(p, c);
-                if (k <= 0 || k + 128 > p.cache->slots()) return false;
-                return !(cap && k * 100 > kAutoLendPct * p.cache->slots());
+                if (k <= 0 || k + 128 > p.cache->alloc_top()) return false;   // the floor: alloc_top, the slice is not lendable
+                return !(cap && k * 100 > kAutoLendPct * p.cache->alloc_top());
             };
             // `only`: CUDA0's cache alone (#448: what one GPU would choose, for the log below); null: every one
             auto fits = [&](int64_t c, bool cap, const PfPart* only = nullptr) -> bool {
@@ -4598,7 +4645,7 @@ int main(int argc, char** argv) {
                                          "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
                 for (PfPart& p : pf_parts) {
-                    p.first = (int32_t) (p.cache->slots() - part_slots(p, chunk));
+                    p.first = (int32_t) (p.cache->alloc_top() - part_slots(p, chunk));
                     p.first_now = p.first;
                 }
                 // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
@@ -4652,7 +4699,7 @@ int main(int argc, char** argv) {
         if (any_loan) {
             if (borrow != nullptr)
                 std::fprintf(stderr, "strata serve: the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)\n",
-                             (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
+                             (long long) (xcache.alloc_top() - lend_first), (double) borrow_bytes / 1073741824.0);
             for (size_t i = 1; i < pf_parts.size(); ++i)   // one loan per stage, from that stage's own cache
                 if (pf_parts[i].first >= 0) std::fprintf(stderr, "strata serve:   CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)\n",
                              pf_parts[i].dev, (long long) (pf_parts[i].cache->slots() - pf_parts[i].first),
@@ -4749,7 +4796,7 @@ int main(int argc, char** argv) {
                 if (any_loan) {                  // smaller loans for the smaller chunk
                     for (PfPart& p : pf_parts)
                         if (p.first >= 0) {
-                            p.first = (int32_t) (p.cache->slots() - part_slots(p, next));
+                            p.first = (int32_t) (p.cache->alloc_top() - part_slots(p, next));
                             p.first_now = p.first;
                         }
                     lend_first = pf_parts[0].first;
@@ -4790,7 +4837,7 @@ int main(int argc, char** argv) {
             int64_t evicted = 0;
             for (PfPart& p : pf_parts) {
                 if (S <= 0 || p.first < 0) continue;
-                const int32_t first_s = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, S)));
+                const int32_t first_s = std::max<int32_t>(p.first, (int32_t) (p.cache->alloc_top() - part_slots(p, S)));
                 int64_t n = 0;
                 for (int64_t l = p.lb; l < p.le; ++l)
                     for (int64_t ex = 0; ex < g.n_expert; ++ex) {
@@ -4800,7 +4847,7 @@ int main(int argc, char** argv) {
                 evicted += n;
                 std::fprintf(stderr, "strata serve:   CUDA%d keeps %lld slots for %lld-token prompts (%lld experts "
                                      "no longer resident)\n", p.dev < 0 ? 0 : p.dev,
-                             (long long) (p.cache->slots() - first_s), (long long) S, (long long) n);
+                             (long long) (p.cache->alloc_top() - first_s), (long long) S, (long long) n);
             }
             if (evicted > 0) {
                 if (d_res != nullptr)
@@ -4811,7 +4858,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
+        kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.alloc_top());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
@@ -4936,11 +4983,6 @@ int main(int argc, char** argv) {
         // parked image by park_current.  Turn N-1's routing covers ~87% of turn N's (layer, expert) pairs and
         // the conversation's union ~94% (measured: post-restore-slow-tail.md E7, realistic text).
         std::vector<int32_t> conv_heat;
-        // the resolved anticipation slice size (0 = off): --expert-anticipation, STRATA_PF_ANTICIPATE overrides
-        const int64_t anticipation_slots = [&o] {
-            const char* v = std::getenv("STRATA_PF_ANTICIPATE");
-            return v != nullptr ? std::atoll(v) : o.expert_anticipation;
-        }();
         // the conversation's ranked routing: count desc, then flat index, truncated to the slice's slot count
         auto rank_experts = [&g](const std::vector<int32_t>& heat, size_t cap) {
             std::vector<strata::core::SavedConversation::RoutedExpert> out;
@@ -5205,6 +5247,7 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e))) cand.emplace_back(u[e], e); }
+                    else if (r[e] >= xcache.alloc_top()) continue;   // the anticipation slice is not the adaptive tier's to swap
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -5683,6 +5726,58 @@ int main(int argc, char** argv) {
                 incoming.reset();
                 err.clear();
             }
+            // ---- the working-set feature: the anticipation-slice swap.  The incoming image's ranked routing
+            // fills the reserved slots on the slice's own stream while the outgoing conversation parks (D2H,
+            // legacy stream) and the incoming one restores - full-duplex PCIe, so the fills hide in that
+            // window (measured park+restore ~130-330 ms; 2048 slots x 2.6 MB at ~25 GB/s is ~210 ms).  The
+            // window is safe for a side stream: the device synchronized above, and nothing reads expert
+            // slots until the loan or the first window, both after the land below.  host_res entries change
+            // at issue time (the loan-refill discipline); the device table uploads once the fills land.
+            bool slice_swap_queued = false;
+            size_t slice_fetched = 0, slice_kept = 0, slice_had = 0;
+            const auto slice_t0 = Clock::now();
+            if (xcache.reserved() > 0 && antic_stream != nullptr && !host_res.empty() && srcp != nullptr) {
+                std::vector<std::pair<int32_t, int32_t>> want_set;   // the incoming conversation's pairs
+                if (incoming)
+                    for (const auto& re : incoming->experts)
+                        if (re.layer < g.n_layers && re.expert < g.n_expert)
+                            want_set.emplace_back(re.layer, re.expert);
+                size_t already = 0;
+                for (const auto& we : want_set)
+                    if (host_res[(size_t) we.first * g.n_expert + we.second] >= 0) ++already;
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= xcache.alloc_top()) ++slice_had;
+                // the thrash guard: >=90% of the wanted set resident already (the slice holds it, or the
+                // adaptive tier does) - the swap would fetch almost nothing, so keep the current slice
+                if (!want_set.empty() && already * 10 < want_set.size() * 9) {
+                    for (size_t i = 0; i < host_res.size(); ++i)
+                        if (host_res[i] >= xcache.alloc_top()) host_res[i] = strata::core::kNotResident;
+                    const auto& lay = strata::kernels::cpu::expert_layout();
+                    int64_t slot = xcache.alloc_top();
+                    for (const auto& we : want_set) {
+                        if (slot >= xcache.slots()) break;   // the set outranks the slice: hottest first
+                        const size_t i = (size_t) we.first * g.n_expert + we.second;
+                        if (host_res[i] >= 0) { ++slice_kept; continue; }   // resident below the slice already
+                        const uint8_t* b = srcp->blob(we.first, we.second);
+                        if (b == nullptr) continue;
+                        std::string ferr;
+                        if (!xcache.fill_slot((int32_t) slot, b, (void*) antic_stream, ferr,
+                                              (int64_t) lay.blob_bytes(we.first))) {
+                            // degraded, not fatal: this turn runs without the slice
+                            for (size_t i2 = 0; i2 < host_res.size(); ++i2)
+                                if (host_res[i2] >= xcache.alloc_top()) host_res[i2] = strata::core::kNotResident;
+                            std::fprintf(stderr, "strata serve: expert anticipation: a fill failed (%s); "
+                                                 "continuing without the slice this turn\n", ferr.c_str());
+                            slice_fetched = 0;
+                            break;
+                        }
+                        host_res[i] = (int32_t) slot;
+                        ++slot;
+                        ++slice_fetched;
+                    }
+                    slice_swap_queued = slice_fetched > 0;
+                }
+            }
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
             if ((!from_live || incoming) && !park_current(incoming ? incoming->bytes() : 0)) {
@@ -5739,6 +5834,22 @@ int main(int argc, char** argv) {
                 live_ok = false;
                 checks.clear();
                 cvec_cached = want_cvec;
+            }
+            // the working-set feature: land the anticipation slice - the fills have had the whole park and
+            // the whole restore to complete; this sync + table upload is the only serialization, and it runs
+            // before kvg_trim, the loan and the first window read host_res
+            if (slice_swap_queued) {
+                const cudaError_t se = cudaStreamSynchronize(antic_stream);
+                if (se != cudaSuccess) {
+                    std::printf("ERR the anticipation slice could not land: %s\n", cudaGetErrorString(se));
+                    std::fflush(stdout);
+                    return 1;
+                }
+                res_upload();
+                std::fprintf(stderr, "strata serve: expert anticipation: %zu pairs into %lld slots (%zu already "
+                                     "resident, %zu were held; %.1f ms, hidden in the park/restore)\n",
+                             slice_fetched, (long long) xcache.reserved(), slice_kept, slice_had,
+                             std::chrono::duration<double, std::milli>(Clock::now() - slice_t0).count());
             }
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
@@ -5972,7 +6083,7 @@ int main(int argc, char** argv) {
                         if (!refill_one(p, e)) return false;
                     }
                     const strata::core::OnDevice on(p.dev);
-                    const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
+                    const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->alloc_top() - part_slots(p, want)));
                     if (want != p.sp->chunk() || first != p.first_now) {
                         if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
@@ -6518,7 +6629,7 @@ int main(int argc, char** argv) {
             }
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             if (k > 0) {   // the lent slots are refilled after the prompt
-                const int32_t first = (int32_t) (xcache.slots() - k);
+                const int32_t first = (int32_t) (xcache.alloc_top() - k);
                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
                 kvg_started = true;
                 kvg_start(first);
@@ -6559,7 +6670,7 @@ int main(int argc, char** argv) {
         }
         if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
             kvg_started = true;
-            kvg_start(xcache.slots());
+            kvg_start(xcache.alloc_top());   // the anticipation slice at the top is never K/V room
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
@@ -6605,7 +6716,7 @@ int main(int argc, char** argv) {
 
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
         kvg_started = true;
-        kvg_start(xcache.slots());
+        kvg_start(xcache.alloc_top());   // the anticipation slice at the top is never K/V room
         if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
     }
     for (int64_t pos = pos_start;; ++pos) {
