@@ -383,6 +383,40 @@ side instance answered the same calls in a flat 0.15 s and left the main
 engine's log empty (I-side ~= U). That is the measured case for the side
 instance: not eviction protection but latency isolation.
 
+**E17 — v2, the SUBSTANTIVE interrupt: still no warm-up, and the mechanism
+is closed (2026-10-04).** E16's interrupt was 5 tokens - too thin to test
+the hypothesis (prefill misses stream without admitting; only decode
+admits). v2 (notes/warmup_ab_probe2.py) interrupts with a NEW ~480-token
+unrelated-domain conversation (cooking / marine biology / contract law /
+prosody, no prefix reuse) that DECODES 250 tokens - dispatch admits its
+experts and evicts colder (the main's). Proof the pollution is real: the
+post-interrupt K/V re-grow relocated 656-696 experts, vs 94-282 in E16.
+
+Client walls suggested +0.7 s for I-main (U 2.95 / I-side 3.06 / I-main
+3.67 s) - a confound: I-main's appends happened to draw the 250-token
+answers (walls include generation). The engine log splits prompt from
+decode and kills it - next main-append READ walls: U 1552 / I-side 1644 /
+I-main 1633 ms (the ~90 ms spread between arms is rotation drift; I-side,
+whose interrupts ran on another GPU, sits ABOVE I-main); decode tok/s: U
+98 / I-side 112 / I-main 119 - no cold-decode ramp. Streamed per append:
+U 31.9 / I-side 23.5 / I-main 30.5 GiB - no arm pattern.
+
+Why displacement can't hurt here: a ~430-token chunk routes essentially
+every expert per layer (3440 draws over 512 bins misses <1 per layer), so
+the append streams the touched-minus-resident complement regardless - a
+wall set by cache CAPACITY (~7,959 of 31,744 experts resident), not by
+which 9% of slots the interrupt swapped. Marginal cost = displaced-and-
+touched-and-was-a-hit x 2.7 MB / 26.3 GB/s ~= 20-80 ms. And the trim-time
+refill re-seeds the cache from the LEARNED profile (the main conversation's
+own hot set) before the interrupt decodes, shrinking that intersection
+further - the #477 profile is the warm-up fix, already deployed.
+
+What would make it bite: minutes of main-engine decode on unrelated
+traffic (a sub-agent), admitting thousands of its experts. That is
+precisely the workload the side instance exists to absorb - and even then
+the append wall is capacity-bound, so the damage is bounded to the moved
+set's share of residency.
+
 Caveats: the interrupt generated 8 tokens (real tool calls generate more,
 which adds to the interrupt's wall but not to any warm-up); the append's
 ~2.1 s small-tail floor at 144k could mask a sub-0.1 s term; no cache-slot
