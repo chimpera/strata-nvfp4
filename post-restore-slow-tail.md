@@ -573,3 +573,13 @@ for name, seed in (("a", 0), ("b", 1000)):
   stacked on it) still lost; the tier stays rejected on this box. The
   corrected physics - big chunks route nearly every expert, so the wall is
   now the honest miss-stream floor - is recorded in §7e.
+- **Upstream ports #699 and #693 (late night)**: read-ahead at startup
+  (madvise/fadvise WILLNEED walks over weights, dense, profile fill, RAM
+  copy, MTP drafts; STRATA_READ_AHEAD=0 off) and the finer auto-chunk list
+  + equal prompt chunks - #693's stated physics is this doc's §7d/§7e,
+  arrived at independently upstream. Both parity-gated byte-exact, both
+  live in production (fa005ec, 71dc3cb). The startup phases now log their
+  durations; the c524 profile fill reads 0.9 s / 25.7 GB/s warm. The
+  fill-ahead advise line does not print on the c524 preset (its source
+  wiring takes a different srcp); the cold-start benefit shows after the
+  next reboot.
