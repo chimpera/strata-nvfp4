@@ -350,6 +350,44 @@ probes 26.3 GB/s - Gen4 x16), or shrinking the touched set per chunk.
 right-sized stream, the tier's per-layer sync waits and input staging cost
 more than the 6,000 experts x 2.7 MB it removes from the miss stream.
 
+**E16 — the warm-up-after-switch hypothesis: REFUTED (2026-10-04).**
+The felt cost of a side call was assumed to be the ~0.3-0.6 s switch PLUS a
+warm-up the main agent pays on its next turn (elastic K/V re-grow, expert
+churn). Synthetic A/B/C on the live c524 preset (notes/warmup_ab_probe.py at
+~26k depth, notes/warmup_ab_probe_deep.py at ~144k; a deep main conversation,
+interrupted between turns by a 5-token unrelated task, round-rotated: U =
+quiet gap, I-side = task on the side instance, I-main = task on the MAIN
+engine; the next main append (427 fresh tokens) is the measurement):
+
+| depth | U | I-side | I-main |
+| --- | --- | --- | --- |
+| ~26k | 1.45 s | 1.49 s | 1.43 s |
+| ~144k | 2.09 s | 2.19 s | 2.13 s |
+
+No warm-up term at either depth: the append after a main-engine interrupt
+equals the uninterrupted append (bounded <= ~0.1 s at 144k). The engine log
+shows the predicted machinery all firing per I-main interrupt at 144k -
+park 142k tokens in 295 ms; K/V trimmed to 8192, 691 slots back, refilled
+from the profile; re-grown to 147456 cells, 94-282 hotter experts moved
+(~0.3-0.8 GB of D2D, tens of ms); restore 142k tokens (checkpoint) in
+112 ms - and the refill+regrow land INSIDE the interrupt's own wall, not in
+the next append. The restore is RAM-resident and checkpoint-based, so it
+stays ~O(delta), not O(image).
+
+What the switch DOES cost is the interrupt's own serialized wall, and that
+scales with the parked conversation: 0.31 s at 26k -> 0.62 s at 144k (park
+121->295 ms, restore 26->112 ms, and the trim/refill churn slows the tiny
+read itself 24 -> 10 tok/s). So every side call answered by the MAIN engine
+gets linearly more expensive as the main conversation deepens, while the
+side instance answered the same calls in a flat 0.15 s and left the main
+engine's log empty (I-side ~= U). That is the measured case for the side
+instance: not eviction protection but latency isolation.
+
+Caveats: the interrupt generated 8 tokens (real tool calls generate more,
+which adds to the interrupt's wall but not to any warm-up); the append's
+~2.1 s small-tail floor at 144k could mask a sub-0.1 s term; no cache-slot
+pressure (18 of 48 slots, 0 evictions).
+
 ## 8. Fix directions (ranked, fork-side, upstream-able)
 
 *(2026-10-04 postscript: 1 and 2 are BUILT (commits cee2509, 2566a60,
