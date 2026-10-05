@@ -2954,8 +2954,7 @@ def make_handler(svc: Service):
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         body_read = False                                   # whether a handler took this request's body
-        DRAIN_LIMIT = 1 << 26                               # the most an unread body is read and dropped (64 MiB: a long
-                                                            # agent conversation or a picture is several MiB; the 5 s timeout bounds it)
+        DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
         def log_message(self, fmt, *args):
             pass
@@ -2964,15 +2963,21 @@ def make_handler(svc: Service):
             super().handle_one_request()
             self._drain_body()
 
-        def _body(self) -> bytes:
-            self.body_read = True
-            return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        def _body(self, length=None) -> bytes:
+            """The request body, read by its handler.  Read whole, the drain leaves it alone; cut short, the drain
+            takes what is left."""
+            length = int(self.headers.get("Content-Length", 0)) if length is None else length
+            body = self.rfile.read(length)
+            self.body_read = len(body) == length
+            return body
 
         def _drain_body(self):
-            """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
+            """An answer sent before the body was read (a 401, a 403, a 413, a method with no handler) must not close
             the connection on unread bytes: the close then sends a reset, and a client that sends its body after the
             headers (http.client, urllib, requests) gets a connection error instead of the answer.  So the body is
-            read and dropped here, once, after an answer.  A body over DRAIN_LIMIT is left unread."""
+            read and dropped here, once, after an answer, in pieces so that its size is never held in memory.  What
+            has not arrived DRAIN_SECONDS later is left unread: the limit is time, so that a conversation of many
+            megabytes, at any speed the client has, still gets its answer."""
             headers = getattr(self, "headers", None)
             if self.body_read or headers is None:
                 return
@@ -2980,13 +2985,27 @@ def make_handler(svc: Service):
                 left = int(headers.get("Content-Length", 0))
             except ValueError:
                 return
-            if not 0 < left <= self.DRAIN_LIMIT:
+            if left <= 0:
                 return
-            self.connection.settimeout(5)                    # a client that never sends what it announced
-            try:
-                self.rfile.read(left)
-            except OSError:
-                pass
+            deadline = time.monotonic() + self.DRAIN_SECONDS
+            # One socket read at a time: read() would wait for it all.  A handler read that timed out leaves rfile
+            # refusing every read ("cannot read from timed out object"); the socket itself still reads, so the rest
+            # comes from there (what that read had taken is not known, so this one can run to the deadline).
+            read = self.rfile.read1
+            while left > 0 and (wait := deadline - time.monotonic()) > 0:
+                try:
+                    self.connection.settimeout(wait)         # a client that never sends what it announced
+                    piece = read(min(left, 1 << 20))
+                except TimeoutError:
+                    break
+                except OSError:
+                    if read == self.connection.recv:
+                        break
+                    read = self.connection.recv
+                    continue
+                if not piece:
+                    break
+                left -= len(piece)
 
         def parse_request(self):
             """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
@@ -3388,7 +3407,7 @@ def make_handler(svc: Service):
             timeout = self.connection.gettimeout()
             try:
                 self.connection.settimeout(2.0)
-                complete = len(self.rfile.read(length)) == length
+                complete = len(self._body(length)) == length
             except OSError:
                 complete = False
             finally:
@@ -3423,7 +3442,7 @@ def make_handler(svc: Service):
         def _config_post(self):
             """#564: change a few documented keys of the run config - JSON from Strata's own page only, as
             /settings (the key is checked before); every other key of the file stays as it is."""
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = self._body()
             if not self._own_page("the run config can be changed"):
                 return
             if not svc.config_path:
