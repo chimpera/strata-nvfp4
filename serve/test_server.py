@@ -2314,6 +2314,19 @@ class WebApp(unittest.TestCase):
                 code, _, body = self.get("/slots")
                 self.assertEqual(code, 200)
                 self.assertEqual(json.loads(body), [{"id": 0, "n_ctx": CTX, "is_processing": busy}])
+            # While a prompt is being read the engine's (read, total) tuple is
+            # exposed in llama.cpp field names for gateway progress polling.
+            engine.progress = (12, 40)
+            try:
+                with self.svc.status_lock:
+                    self.svc.status["busy"] = True
+                code, _, body = self.get("/slots")
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(body), [{"id": 0, "n_ctx": CTX, "is_processing": True,
+                                                     "n_prompt_tokens_processed": 12,
+                                                     "n_prompt_tokens": 40}])
+            finally:
+                del engine.progress
         finally:
             with self.svc.status_lock:
                 self.svc.status["busy"] = False

@@ -3916,6 +3916,13 @@ def make_handler(svc: Service):
                     with svc.status_lock:
                         busy = bool(svc.status.get("busy"))
                     slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
+                    progress = getattr(svc.engine, "progress", None)
+                    if progress:
+                        # llama.cpp field names: a gateway polling /slots while the backend is
+                        # silently prompt-processing (mlab's mlab-pp keepalive) reads these to
+                        # report read progress; without them every read on this engine reports
+                        # 0/N forever and clients see no (or a stuck-0%) progress line.
+                        slot["n_prompt_tokens_processed"], slot["n_prompt_tokens"] = progress
                     self._json(200, [slot] if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
