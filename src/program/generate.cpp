@@ -6305,6 +6305,13 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // House patch (T1 conversation identity): the x-conversation-id and
+        // ephemeral flag of the conversation CURRENTLY resident in the session.
+        // park_current tags the snapshot with these; an ephemeral conversation
+        // is never parked at all (its K/V is simply left for the next request
+        // to overwrite, the same discard a sub-resident conversation takes).
+        std::string cur_conv;
+        bool cur_ephemeral = false;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
@@ -6392,6 +6399,11 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if (cur_ephemeral) {   // T1: the client certified this conversation dead-when-done
+                std::fprintf(stderr, "strata serve: conversation cache: ephemeral conv (%zu tokens) not parked\n",
+                             live.size());
+                return true;
+            }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
@@ -6497,6 +6509,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
                     return true;
                 }
+                image.conv_id = cur_conv;   // T1: exact-drop identity for DROPID
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
@@ -7796,6 +7809,36 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") break;
+            if (line.rfind("DROPID ", 0) == 0) {
+                // House patch (T1): exact drop by x-conversation-id - the
+                // caller names the conversation it certified dead; no
+                // tokenization, no probe divergence possible. Idempotent.
+                std::string id = line.substr(7);
+                id.erase(std::remove_if(id.begin(), id.end(),
+                      [](char c) { return !(std::isalnum((unsigned char) c) || c == '.' || c == '_' ||
+                                             c == ':' || c == '/' || c == '-'); }), id.end());
+                const size_t removed = conversations.drop_id(id);
+                std::printf("DROPED %zu\n", removed);
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("DROP ", 0) == 0) {
+                // Purge hint: the caller certifies this prompt prefix is dead, so its
+                // parked images leave now instead of outliving their owner until LRU
+                // evicts them. Text-only probe; both steering modes are searched.
+                // Bidirectional prefix matching; no-op on a miss (idempotent hint).
+                std::vector<int64_t> ids;
+                std::string pe;
+                if (!parse_i64_list(line.c_str() + 5, ids, pe))
+                    std::printf("ERR bad drop: %s\n", pe.empty() ? "ids" : pe.c_str());
+                else {
+                    size_t removed = 0;
+                    for (const bool cv : {false, true}) removed += conversations.drop(ids, {}, cv);
+                    std::printf("DROPED %zu\n", removed);
+                }
+                std::fflush(stdout);
+                continue;
+            }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() {
@@ -8044,6 +8087,8 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            std::string req_conv;     // T1: x-conversation-id (exact-drop identity)
+            bool req_ephemeral = false;   // T1: x-conversation-ephemeral - never park this conversation
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -8061,6 +8106,14 @@ int main(int argc, char** argv) {
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "conv") {   // T1: a single non-space token ([A-Za-z0-9._:/-]); sanitized here
+                        req_conv = tok.substr(eq + 1);
+                        req_conv.erase(std::remove_if(req_conv.begin(), req_conv.end(),
+                              [](char c) { return !(std::isalnum((unsigned char) c) || c == '.' || c == '_' ||
+                                                     c == ':' || c == '/' || c == '-'); }), req_conv.end());
+                        if (req_conv.size() > 256) req_conv.resize(256);
+                    }
+                    else if (key == "ephemeral") req_ephemeral = tok == "ephemeral=1";
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -8375,6 +8428,11 @@ int main(int argc, char** argv) {
                 }
                 live = std::move(incoming->live.ids);
                 live_imgs = std::move(incoming->live.imgs);
+                // T1: a restored conversation keeps the identity it was parked
+                // under; a request that carried its own id (the usual case)
+                // says the same thing. A restore without either stays anonymous.
+                if (!incoming->conv_id.empty()) cur_conv = std::move(incoming->conv_id);
+                cur_ephemeral = false;   // an ephemeral conversation is never parked, so never restored
                 if (stages.empty()) {
                     checks = std::move(incoming->checkpoints);
                 } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
@@ -8397,6 +8455,15 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }
+            // T1 conversation identity: this request is now the resident
+            // conversation. The request's own id is authoritative (a restored
+            // image's id already matches it in the normal case); an anonymous
+            // continuation of a named conversation keeps the name. The
+            // ephemeral flag is per the client's certification of THIS
+            // conversation - an anonymous request after an ephemeral one
+            // resumes normal parking (one-shots mark every request).
+            if (!req_conv.empty()) cur_conv = req_conv;
+            cur_ephemeral = req_ephemeral;
             if (want_cvec != cvec_cached) {
                 live_ok = false;
                 checks.clear();

@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -152,10 +153,18 @@ struct SavedConversation {
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    // House patch (T1 conversation identity): the client-supplied
+    // x-conversation-id this conversation was served under, and the
+    // ephemeral flag (ephemeral conversations are never parked at all, so
+    // an entry carrying it can only come from an older engine). Both are
+    // exact-drop metadata: matching for RESTORE still runs on token
+    // prefixes, which is what reuse correctness needs.
+    std::string conv_id;
+    bool ephemeral = false;
 
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
-                   kv.capacity() * sizeof(ConversationKv);
+                   kv.capacity() * sizeof(ConversationKv) + conv_id.capacity();
         for (const auto& s : stage_images) n += s.bytes();
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
@@ -191,6 +200,7 @@ public:
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
+    size_t dropped() const { return dropped_; }
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
@@ -230,6 +240,63 @@ public:
             for (const auto& c : e.checkpoints) consider(c, false);
         }
         return best;
+    }
+
+    // Purge hint: the caller certifies this prefix is dead, so its parked
+    // images leave now instead of waiting for LRU. Deliberately looser than
+    // best(): either side may prefix the other, and EQUAL length matches -
+    // the probe replays a finished request, whose parked entry is the same
+    // length, which conversation_prefix() would (correctly, for reuse) reject.
+    // Text probes carry empty images, so multimodal entries never match one.
+    template<class Token>
+    size_t drop(const std::vector<Token>& probe, const std::vector<ConversationImageKey>& images, bool cvec) {
+        size_t removed = 0;
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->cvec != cvec) { ++it; continue; }
+            auto hit = [&](const ConversationCheckpoint& c) {
+                const size_t m = std::min(c.ids.size(), probe.size());
+                if (m == 0 || !std::equal(c.ids.begin(), c.ids.begin() + (ptrdiff_t) m, probe.begin())) return false;
+                // the overlapping window must agree on image identity too: same
+                // image keys positioned before m on both sides (empty for text)
+                auto within = [&](std::vector<ConversationImageKey> k) {
+                    k.erase(std::remove_if(k.begin(), k.end(),
+                          [&](const ConversationImageKey& x) { return x.start >= (int64_t) m; }), k.end());
+                    return k;
+                };
+                return within(c.imgs) == within(images);
+            };
+            bool match = hit(it->live);
+            for (const auto& c : it->checkpoints) match = match || hit(c);
+            if (match) {
+                bytes_ -= it->bytes();
+                ++dropped_;
+                ++removed;
+                it = entries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return removed;
+    }
+
+    // House patch (T1): drop every entry parked under this exact
+    // conversation id (x-conversation-id). No tokenization needed on
+    // either side; idempotent on a miss. cvec-agnostic: an id names a
+    // conversation, not a steering mode.
+    size_t drop_id(const std::string& conv_id) {
+        if (conv_id.empty()) return 0;
+        size_t removed = 0;
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->conv_id == conv_id) {
+                bytes_ -= it->bytes();
+                ++dropped_;
+                ++removed;
+                it = entries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return removed;
     }
 
     SavedConversation take(size_t index) {
@@ -297,7 +364,7 @@ public:
     }
 
 private:
-    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
+    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, dropped_ = 0;
     std::deque<SavedConversation> entries_; // least recently active first
     ConversationKvReuse reuse_;
 };

@@ -205,6 +205,63 @@ int main() {
               "an oversized put drops nothing");
     }
     {
+        // drop(): bidirectional prefix (equality matches), whole-entry removal
+        const size_t one = image({1,2,3}).bytes();
+        ConversationCache cache(one*8, 8);
+        cache.put(image({1,2,3})); cache.put(image({9,8,7}));
+        const std::vector<int32_t> probe_a = {1,2,3};
+        check(cache.drop(probe_a, {}, true) == 1, "equal probe drops its entry");
+        check(cache.dropped() == 1, "dropped counter");
+        check(cache.size() == 1 && cache.bytes() == one, "drop erases the whole entry and its bytes");
+        check(cache.drop(probe_a, {}, true) == 0, "no-op after the entry is gone");
+        check(cache.best(a, {}, true).tokens == 0, "the dropped entry no longer matches");
+        const std::vector<int32_t> longer = {9,8,7,11,12}, tiny = {}, disjoint = {4,5}, branch = {1,2,9}, img_probe = {1,2,3}, img_probe2 = {1,2,3,4};
+        check(cache.drop(longer, {}, true) == 1, "probe longer than entry drops it (bidirectional)");
+        ConversationCache deep(one*8, 8);
+        auto multi = image({1,2,3});
+        ConversationCheckpoint cp; cp.ids = {1}; cp.gdn.resize(16, 5);
+        multi.checkpoints.push_back(std::move(cp));
+        deep.put(std::move(multi));
+        deep.put(image({1,2,9}));
+        check(deep.drop(probe_a, {}, true) == 1, "entry erased whole when only a checkpoint matches too");
+        check(deep.drop(probe_a, {}, true) == 0, "checkpoint match removed the whole entry");
+        const std::vector<int64_t> probe_branch = {1,2,9,10};
+        check(deep.size() == 1 && deep.best(probe_branch, {}, true).tokens == 3, "unrelated branch survives");
+        check(deep.drop(tiny, {}, true) == 0, "empty probe drops nothing");
+        check(deep.drop(disjoint, {}, true) == 0, "disjoint probe drops nothing");
+        check(deep.drop(branch, {}, false) == 0, "cvec mismatch blocks the drop");
+        ConversationCache imgs_cache(one*8, 8);
+        auto with_img = image({1,2,3});
+        with_img.live.imgs = {{1, 123}};
+        imgs_cache.put(std::move(with_img));
+        check(imgs_cache.drop(img_probe, {}, true) == 0, "text probe does not drop a multimodal entry");
+        check(imgs_cache.drop(img_probe2, {{1, 456}}, true) == 0, "image identity mismatch blocks the drop");
+        check(imgs_cache.drop(img_probe, {{1, 123}}, true) == 1, "matching image keys drop it");
+    }
+    {
+        // House (T1): exact drop by conversation id - the parked image carries
+        // the client's x-conversation-id; DROPID removes by identity, not tokens.
+        const size_t id_one = image({1,2,3}).bytes();
+        ConversationCache idc(id_one*8, 8);
+        auto named_a = image({1,2,3});
+        named_a.conv_id = "sess-alpha";
+        auto named_b = image({4,5,6});
+        named_b.conv_id = "sess-beta";
+        auto anonymous = image({7,8,9});
+        idc.put(std::move(named_a));
+        idc.put(std::move(named_b));
+        idc.put(std::move(anonymous));
+        check(idc.drop_id("sess-alpha") == 1, "drop_id removes exactly the named entry");
+        check(idc.size() == 2, "unrelated entries survive drop_id");
+        check(idc.drop_id("sess-alpha") == 0, "drop_id is idempotent");
+        check(idc.drop_id("") == 0, "empty id drops nothing");
+        const std::vector<int32_t> beta_probe = {4,5,6,7};
+        check(idc.best(beta_probe, {}, true).tokens == 3, "beta entry still restorable by prefix");
+        check(idc.drop_id("sess-beta") == 1, "second named entry drops too");
+        check(idc.drop_id("no-such-id") == 0, "unknown id is a miss");
+        check(idc.size() == 1, "anonymous entry untouched by id drops");
+    }
+    {
         ConversationCache disabled(0,4), no_slots(1024,0);
         check(!disabled.enabled() && !no_slots.enabled(), "both disable switches");
         check(!disabled.put(image({1,2,3})) && !no_slots.put(image({1,2,3})), "disabled cache stores nothing");

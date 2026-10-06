@@ -35,7 +35,92 @@ ANSWER = "xy" * 1000                             # longer than the old 1024 fall
 class RecordingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_max_new = max_new
+        self.last_sampling = dict(sampling or {})
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+    def purge(self, ids):
+        self.purged: list[int] = list(ids)
+        return 1
+
+    def drop_by_id(self, conv_id):
+        self.dropped_ids: list[str] = list(self.dropped_ids) + [conv_id] if hasattr(self, "dropped_ids") else [conv_id]
+        return 1
+
+
+class PurgeHint(unittest.TestCase):
+    """POST /v1/purge re-tokenizes the prompt on the SAME path as a chat request (the
+    engine matches parked conversations by token ids) and answers {"dropped": n}."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingEngine(tok, "hello", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name="m")
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_purge_sees_the_chat_request_tokens(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "purge me"}],
+                "tools": [{"type": "function", "function": {"name": "f", "description": "d"}}]}
+        s, _ = self.post("/v1/chat/completions", dict(body))
+        self.assertEqual(s, 200)
+        chat_ids = list(self.engine.last_prompt)
+        self.assertTrue(chat_ids)
+        s, b = self.post("/v1/purge", dict(body))
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["dropped"], 1)
+        self.assertEqual(self.engine.purged, chat_ids)         # tokenization parity
+
+    def test_purge_by_conversation_id(self):
+        """House (T1): {"conversation_id": ...} bypasses tokenization; "by": "id" is the
+        capability marker the harness detects."""
+        s, b = self.post("/v1/purge", {"model": "m", "conversation_id": "sess-alpha"})
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b, {"dropped": 1, "by": "id"})
+        self.assertEqual(self.engine.dropped_ids, ["sess-alpha"])
+
+    def test_chat_headers_reach_the_sampling(self):
+        """House (T1): x-conversation-id / x-conversation-ephemeral ride into the
+        sampling dict (the GEN line carries them as conv=/ephemeral= keys)."""
+        req = urllib.request.Request(
+            self.base + "/v1/chat/completions",
+            data=json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).encode(),
+            headers={"Content-Type": "application/json",
+                     "x-conversation-id": "sess-42",
+                     "x-conversation-ephemeral": "1"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertEqual(r.status, 200)
+        self.assertEqual(self.engine.last_sampling.get("_strata_conv"), "sess-42")
+        self.assertIs(self.engine.last_sampling.get("_strata_ephemeral"), True)
+
+    def test_sampling_keys_emit_conv_and_ephemeral(self):
+        """House (T1): the GEN line carries the sanitized id and the flag."""
+        line = StrataEngine.sampling_keys({"_strata_conv": "sess-42", "_strata_ephemeral": True})
+        self.assertIn(" conv=sess-42", line)
+        self.assertIn(" ephemeral=1", line)
+        bad = StrataEngine.sampling_keys({"_strata_conv": "no spaces or \n allowed"})
+        self.assertNotIn("no spaces", bad)
+
+    def test_purge_shapes(self):
+        s, b = self.post("/v1/purge", {"model": "other", "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(s, 404)                              # model pin, as elsewhere
+        s, b = self.post("/v1/purge", {"model": "m"})
+        self.assertEqual(s, 400)                              # bad body, no tokenization
 
 
 class MaxTokens(unittest.TestCase):

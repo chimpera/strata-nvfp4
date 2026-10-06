@@ -832,9 +832,67 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def purge(self, ids, timeout: float = 10.0):
+        """`DROP <ids>`: certify this prompt prefix dead; the engine drops its parked images (see the serve loop).
+        Replies DROPED <n> - 0 on a miss, which is normal (an idempotent hint). Caller holds the service's FIFO,
+        as for VRAM (between requests); a dead engine has nothing parked to drop, and the next request restarts it."""
+        if not self.alive():
+            return 0
+        try:
+            self._send("DROP " + ",".join(str(int(t)) for t in ids))
+        except EngineDied:
+            return 0
+        deadline = time.time() + timeout
+        while True:                                          # tolerate stray INFO lines between requests
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                return 0
+            if line is None or line.startswith("ERR"):
+                return 0
+            if line.startswith("DROPED"):
+                f = line.split()
+                return int(f[1]) if len(f) >= 2 and f[1].isdigit() else 0
+            if time.time() > deadline:
+                return 0
+
+    def drop_by_id(self, conv_id: str, timeout: float = 10.0) -> int:
+        """`DROPID <id>` (house, T1): drop the parked conversation served under this exact
+        x-conversation-id. Replies DROPED <n> - 0 on a miss (idempotent). Caller holds the
+        service's FIFO, as for VRAM and purge (between requests)."""
+        safe = "".join(c for c in str(conv_id) if c.isalnum() or c in "._:/-")[:256]
+        if not safe:
+            return 0
+        if not self.alive():
+            return 0
+        try:
+            self._send("DROPID " + safe)
+        except EngineDied:
+            return 0
+        deadline = time.time() + timeout
+        while True:                                          # tolerate stray INFO lines between requests
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                return 0
+            if line is None or line.startswith("ERR"):
+                return 0
+            if line.startswith("DROPED"):
+                f = line.split()
+                return int(f[1]) if len(f) >= 2 and f[1].isdigit() else 0
+            if time.time() > deadline:
+                return 0
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
+        conv = sampling.get("_strata_conv")            # T1 conversation identity (house)
+        if isinstance(conv, str) and conv:
+            safe = "".join(c for c in conv if c.isalnum() or c in "._:/-")[:256]
+            if safe:
+                keys += f" conv={safe}"
+        if sampling.get("_strata_ephemeral") is True:  # T1: never park this conversation
+            keys += " ephemeral=1"
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -2421,6 +2479,35 @@ class Service:
             if ctl is not None:
                 ctl.release()
             self.fifo.release()
+
+    def purge(self, ids):
+        """POST /v1/purge: a hint certifying this prompt prefix dead, so its parked images release their RAM and
+        cache slot now (see StrataEngine.purge). Takes the request FIFO like VRAM - a DROP never interleaves with
+        a stream; a hint that cannot get the turn drops nothing, and the LRU policy stays the backstop."""
+        with self.fifo:
+            ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+            if ctl is not None and not ctl.acquire(timeout=self.vram_wait_s):
+                return 0
+            try:
+                engine_purge = getattr(self.engine, "purge", None)   # mock/older engines: nothing to hint
+                return engine_purge(ids) if engine_purge else 0
+            finally:
+                if ctl is not None:
+                    ctl.release()
+
+    def drop_by_id(self, conv_id):
+        """House (T1): exact purge by x-conversation-id - same locking contract as the prefix
+        purge (the request FIFO, then the control lines when batching); a miss drops nothing."""
+        with self.fifo:
+            ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+            if ctl is not None and not ctl.acquire(timeout=self.vram_wait_s):
+                return 0
+            try:
+                drop = getattr(self.engine, "drop_by_id", None)
+                return drop(conv_id) if drop else 0
+            finally:
+                if ctl is not None:
+                    ctl.release()
 
     def _say_died(self, e: Exception) -> None:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
@@ -4025,6 +4112,8 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
+                elif path == "/v1/purge":
+                    self._purge(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
                 else:
@@ -4079,7 +4168,11 @@ def make_handler(svc: Service):
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
                      "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
-                     "is_sleeping": not svc.loaded()}
+                     "is_sleeping": not svc.loaded(),
+                     # clients feature-detect the purge hint here instead of probing 404s (serve: POST /v1/purge)
+                     "purge": hasattr(svc.engine, "purge"),
+                     # house (T1): exact drop by x-conversation-id is available
+                     "purge_id": hasattr(svc.engine, "drop_by_id")}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
@@ -4243,8 +4336,19 @@ def make_handler(svc: Service):
             finally:
                 items.close()
 
+        def _strata_conv_from_headers(self, req):
+            """House (T1): x-conversation-id / x-conversation-ephemeral ride the request into
+            the sampling dict (the GEN line carries them as conv=/ephemeral= keys). Additive:
+            absent headers change nothing."""
+            conv = self.headers.get("x-conversation-id")
+            if conv:
+                req = {**req, "_strata_conv": conv[:256]}
+            if str(self.headers.get("x-conversation-ephemeral", "")).strip().lower() in ("1", "true"):
+                req = {**req, "_strata_ephemeral": True}
+            return req
+
         def _openai(self, req):
-            req = svc.with_shared(req, "openai")
+            req = self._strata_conv_from_headers(svc.with_shared(req, "openai"))
             messages, tools, kw = openai_to_messages(req)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
@@ -4445,7 +4549,7 @@ def make_handler(svc: Service):
 
         def _anthropic(self, req):
             svc.load()
-            req = svc.with_shared(req, "anthropic")
+            req = self._strata_conv_from_headers(svc.with_shared(req, "anthropic"))
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
@@ -4484,6 +4588,40 @@ def make_handler(svc: Service):
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+
+        def _purge(self, req):
+            """POST /v1/purge - a purge HINT, not an API clients expect: the caller certifies this exact prompt's
+            conversation is finished, so its parked images (RAM + a cache slot) are released now rather than rotating
+            out under LRU. OpenAI-shaped body (or dialect: anthropic), tokenized on this same path as a chat request.
+            Idempotent: 0 dropped on a miss; the LRU policy stays the backstop without it."""
+            if req.get("model") and req["model"] not in svc.model_names():
+                self._json(404, {"error": {"message": "model not found"}})
+                return
+            # House (T1): {"conversation_id": ...} drops by exact identity - no
+            # tokenization, no probe divergence. The response's "by": "id" is
+            # the capability marker the harness detects (a prefix-purge reply
+            # carries no "by" field).
+            conv_id = req.get("conversation_id")
+            if conv_id:
+                if not hasattr(svc.engine, "drop_by_id"):
+                    self._json(400, {"error": {"type": "invalid_request_error",
+                                               "message": "conversation_id purge not supported by this engine"}})
+                    return
+                self._json(200, {"dropped": svc.drop_by_id(conv_id), "by": "id"})
+                return
+            if not req.get("messages"):
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "messages required"}})
+                return
+            # "dialect": both API shapes are accepted - a harness replays the components it last SENT,
+            # whichever dialect it speaks; both convert to the same template messages, so the token ids match.
+            if req.get("dialect") not in (None, "openai", "anthropic"):
+                self._json(400, {"error": {"type": "invalid_request_error",
+                                           "message": "dialect must be openai or anthropic"}})
+                return
+            messages, tools, kw = (anthropic_to_messages(req, svc.anthropic_think_unasked)
+                                   if req.get("dialect") == "anthropic" else openai_to_messages(req))
+            ids, _, _ = svc.prepare(messages, tools, kw, 1)
+            self._json(200, {"dropped": svc.purge(ids)})
 
     return Handler
 
