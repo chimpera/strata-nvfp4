@@ -6328,6 +6328,14 @@ int main(int argc, char** argv) {
         // is never parked at all (its K/V is simply left for the next request
         // to overwrite, the same discard a sub-resident conversation takes).
         std::string cur_conv;
+        // House (0015 instrumentation): wall-clock ms stamped on the request/
+        // park/restore log lines so the log can be read as a timeline and
+        // joined with harness-side events; conv= attributes each line to the
+        // conversation (T1 identity; empty for headerless clients).
+        const auto wall_ms = [] {
+            return (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch()).count();
+        };
         bool cur_ephemeral = false;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
@@ -6417,8 +6425,8 @@ int main(int argc, char** argv) {
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             if (cur_ephemeral) {   // T1: the client certified this conversation dead-when-done
-                std::fprintf(stderr, "strata serve: conversation cache: ephemeral conv (%zu tokens) not parked\n",
-                             live.size());
+                std::fprintf(stderr, "strata serve: t=%lld conversation cache: ephemeral conv (%lld tokens) not parked conv=%s\n",
+                             wall_ms(), (long long) live.size(), cur_conv.c_str());
                 return true;
             }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
@@ -6529,9 +6537,9 @@ int main(int argc, char** argv) {
                 image.conv_id = cur_conv;   // T1: exact-drop identity for DROPID
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu dead=%zu stale=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
-                             stored ? "parked" : "skipped", live.size(),
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                std::fprintf(stderr, "strata serve: t=%lld conversation cache: %s %zu tokens in %.1f ms; conv=%s parked=%zu bytes=%zu evictions=%zu dead=%zu stale=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                             wall_ms(), stored ? "parked" : "skipped", live.size(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), cur_conv.c_str(),
                              conversations.size(), conversations.bytes(), conversations.evictions(),
                              conversations.evictions_dead(), conversations.evictions_stale(), snapshot_bytes, reused_bytes);
             } catch (const std::bad_alloc&) {
@@ -8469,19 +8477,25 @@ int main(int argc, char** argv) {
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
-                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
-                             (long long) resume, from_live ? "live" : "checkpoint",
+                std::fprintf(stderr, "strata serve: t=%lld conversation cache: restored %lld tokens (%s) in %.1f ms; conv=%s parked=%zu bytes=%zu\n",
+                             wall_ms(), (long long) resume, from_live ? "live" : "checkpoint",
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes());
+                             cur_conv.c_str(), conversations.size(), conversations.bytes());
             }
             // T1 conversation identity: this request is now the resident
-            // conversation. The request's own id is authoritative (a restored
-            // image's id already matches it in the normal case); an anonymous
-            // continuation of a named conversation keeps the name. The
-            // ephemeral flag is per the client's certification of THIS
-            // conversation - an anonymous request after an ephemeral one
+            // conversation. The request's own id is authoritative; a request
+            // WITHOUT one is unattributed, so the resident id is cleared -
+            // serve interleaves clients, and keeping the previous id stamped
+            // anonymous side queries (a harness sideQuery sends no header)
+            // with the PRECEDING conversation's name, both in the log lines
+            // and in image.conv_id at park time, mislabeling lineages and
+            // letting DROPID-by-id target an image its caller never named.
+            // Park/restore matching is content-based, so an anonymous
+            // continuation still finds its conversation; only the label is
+            // lost. The ephemeral flag is per the client's certification of
+            // THIS conversation - an anonymous request after an ephemeral one
             // resumes normal parking (one-shots mark every request).
-            if (!req_conv.empty()) cur_conv = req_conv;
+            cur_conv = std::move(req_conv);
             cur_ephemeral = req_ephemeral;
             if (want_cvec != cvec_cached) {
                 live_ok = false;
@@ -10098,9 +10112,9 @@ int main(int argc, char** argv) {
                 std::snprintf(read_txt, sizeof(read_txt), "%lld of %lld", (long long) read_n, (long long) fresh);
             else
                 std::snprintf(read_txt, sizeof(read_txt), "%lld", (long long) fresh);
-            std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %s read in %.0f ms (%.1f tok/s), "
+            std::fprintf(stderr, "strata serve: t=%lld conv=%s prompt %lld tokens = %lld reused + %s read in %.0f ms (%.1f tok/s), "
                                  "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
-                         (long long) n, (long long) resume, read_txt, prompt_ms,
+                         wall_ms(), cur_conv.c_str(), (long long) n, (long long) resume, read_txt, prompt_ms,
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
