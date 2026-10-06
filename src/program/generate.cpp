@@ -585,6 +585,8 @@ struct Options {
     int prompt_cache = 6;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
+    // parking-victim order: lru (default) or expectancy (see EvictionPolicy)
+    strata::core::EvictionPolicy conversation_cache_policy = strata::core::EvictionPolicy::lru;
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
@@ -727,6 +729,12 @@ void usage() {
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
+                 "  --conversation-cache-policy MODE  --serve: parking-victim order under pressure: lru (default)\n"
+                 "                       or expectancy - never-returned one-shots (a classifier, a title; quiet past\n"
+                 "                       60 s) and lineages silent far past their own observed return pace are evicted\n"
+                 "                       first.  For agent-harness traffic, where one long-lived conversation (the\n"
+                 "                       session) interleaves with bursts of tiny one-shot requests; statistical,\n"
+                 "                       nothing is dropped without pressure\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -1720,6 +1728,15 @@ int main(int argc, char** argv) {
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+        else if (a == "--conversation-cache-policy") {
+            const std::string v = next("--conversation-cache-policy");
+            if (v == "lru") o.conversation_cache_policy = strata::core::EvictionPolicy::lru;
+            else if (v == "expectancy") o.conversation_cache_policy = strata::core::EvictionPolicy::expectancy;
+            else {
+                std::fprintf(stderr, "strata generate: unknown --conversation-cache-policy value '%s' (expected lru or expectancy)\n", v.c_str());
+                return 2;
+            }
+        }
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
@@ -6320,7 +6337,7 @@ int main(int argc, char** argv) {
         // (the snapshots accept a null draft)
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
-            (size_t) o.conversation_cache_slots);
+            (size_t) o.conversation_cache_slots, o.conversation_cache_policy);
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -6512,10 +6529,11 @@ int main(int argc, char** argv) {
                 image.conv_id = cur_conv;   // T1: exact-drop identity for DROPID
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu dead=%zu stale=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                             conversations.size(), conversations.bytes(), conversations.evictions(),
+                             conversations.evictions_dead(), conversations.evictions_stale(), snapshot_bytes, reused_bytes);
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -7207,7 +7225,7 @@ int main(int argc, char** argv) {
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
+                        "conversation_cache_policy=%s conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -7218,6 +7236,7 @@ int main(int argc, char** argv) {
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                        o.conversation_cache_policy == strata::core::EvictionPolicy::expectancy ? "expectancy" : "lru",
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0)).c_str() : "");
