@@ -1263,6 +1263,9 @@ if(STRATA_NATIVE_EXPERTS)
     # the NVFP4 expert products (w4a8 / w4a4, STRATA_PREFILL_NVFP4) against a double-precision reference
     add_executable(mmq_nvfp4_parity src/prefill/mmq_nvfp4_parity.cpp)
     target_link_libraries(mmq_nvfp4_parity PRIVATE strata_mmq ggml-base CUDA::cudart)
+    if(NOT MSVC)   # its half_round reference uses F16C intrinsics; MSVC allows them under /arch:AVX2
+      set_source_files_properties(src/prefill/mmq_nvfp4_parity.cpp PROPERTIES COMPILE_OPTIONS "-mf16c")
+    endif()
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.
